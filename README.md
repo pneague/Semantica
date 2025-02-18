@@ -10,7 +10,6 @@ This repository implements the **tree construction** and **expansion-round algor
 ---
 
 ## ⚙️ Configuration Parameters
-
 You can customize several parameters before running the script:
 
 ### **Dataset Requirements**
@@ -42,9 +41,21 @@ You can customize several parameters before running the script:
 
 ---
 
+## 📥 Preparing Data: Embedding Queries and Documents
+
+The algorithm requires both queries and documents to be **vector embeddings** (such as with an LLM).  
+To generate these embeddings, you can use the Python scripts in the `embed_with_LLM_files` folder.
+
+1. Run for example the `embed_docs_BERT.py` in `embed_with_LLM_files` to generate the embeddings.
+2. Save the embeddings as `embedded_docs_BERT.pkl`. *(This filename is currently hardcoded in the script. If you wish to use a different filename, you will need to manually update the code.)*
+
+Once the embeddings are generated and stored, you can proceed with running the main algorithm from `main.py`.
+
+---
+
 ## 🏗️ Running the Code
-To execute the algorithm, run:
+
+To execute the algorithm, simply run:
 
 ```bash
 python main.py
-
