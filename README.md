@@ -41,7 +41,7 @@ You can customize several parameters before running the script:
 
 ---
 
-## 📥 Preparing Data: Embedding Queries and Documents
+## 📥 Preparing Data
 
 Create a `dataset` subfolder in the main folder and place in it `data.csv`, `doc.csv` and `query.csv` files from AOL4PS.
 
