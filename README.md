@@ -43,6 +43,8 @@ You can customize several parameters before running the script:
 
 ## 📥 Preparing Data: Embedding Queries and Documents
 
+In the `dataset` folder place the `data.csv`, `doc.csv` and `query.csv` from AOL4PS.
+
 The algorithm requires both queries and documents to be **vector embeddings** (such as with an LLM).  
 To generate these embeddings, you can:
 
@@ -51,7 +53,9 @@ To generate these embeddings, you can:
 
 Once the embeddings are generated and stored, you can proceed with running the main algorithm from `main.py`.
 
+
 ---
+
 
 ## 🏗️ Running the Code
 
