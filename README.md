@@ -18,7 +18,7 @@ You can customize several parameters before running the script:
 - **Note**: Only users with at least `nbr_train_recs_list + nbr_test_records_list` records will be tested. However, the tree may still contain users with fewer records based on the `small_user_filter_for_test_set` setting.
 
 ### **Tree Construction Parameters**
-- **`record_limit_per_leafnode_list`** – Threshold number of users per leaf node before it splits into sub-nodes.
+- **`record_limit_per_leafnode_list`** – Threshold number of users per leaf node before it becomes a split-node.
 - **`small_user_filter_for_test_set`** *(Boolean)* – 
   - `True`: Only include users with sufficient data in the tree.  
   - `False`: Include all users but only test those with enough data.
@@ -26,9 +26,10 @@ You can customize several parameters before running the script:
 ### **Querying Strategies**
 - **`perform_query_options`** *(Default: `None`)* – Defines how queries are processed in the tree. Options:
   - `"Query-as-Node"` – Places the query in the tree and searches for nearest neighbors.
-  - `"Closest-Users"` – Queries the closest users to the sender, regardless of similarity to the query.
+  - `"Closest-Users"` – Queries the closest users to the query based on the querying-user's known-users.
   - `"Closest-User-Chain"` – Uses query forwarding to the neighbor most similar to the query.
 
+  - For the moment, all methods send a hardcoded 50 total queries to the network.
 ### **Search and Expansion Parameters**
 - **`N_list`** *(Default: `[50]`)* – Number of closest users to compare.
 - **`M_multipliers`** *(Default: `[1]`)* – Determines how many users a query will initially contact before selecting the `N` closest users based on cosine similarity.
