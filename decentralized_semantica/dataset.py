@@ -134,13 +134,11 @@ def prepare_pubmedqa_shards(
         target_available=availability,
     )
     manifest = {
-        "schema": "decentralized_semantica_prepared_v1",
+        "schema": "decentralized_semantica_prepared_v2",
         "dataset": "pubmedqa",
         "epoch": epoch,
         "seed": int(seed),
         "parameters": parameters,
-        "peer_ids": list(range(int(peer_count))),
-        "endpoints": {},
         "data_root": str(Path(data_root).resolve()),
         "overlay_dir": str(source_overlay.resolve()),
         "embedding_bundle": {

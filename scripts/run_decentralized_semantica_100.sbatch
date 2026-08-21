@@ -41,9 +41,15 @@ cd "${PROJECT_DIR}"
   --prepared-dir "${PREPARED_DIR}" \
   --run-dir "${RUNTIME_DIR}" \
   --rpc-timeout-seconds 30 \
+  --root-peer-id 0 \
   --run-timeout-seconds 10800
 
-"${PYTHON_BIN}" -m decentralized_semantica validate \
-  --prepared-dir "${PREPARED_DIR}" \
-  --run-dir "${RUNTIME_DIR}" \
+VALIDATE_ARGS=(
+  --prepared-dir "${PREPARED_DIR}"
+  --run-dir "${RUNTIME_DIR}"
   --float32-atol 1e-5
+)
+if [[ -n "${REFERENCE_RUN:-}" ]]; then
+  VALIDATE_ARGS+=(--reference-run "${REFERENCE_RUN}")
+fi
+"${PYTHON_BIN}" -m decentralized_semantica validate "${VALIDATE_ARGS[@]}"

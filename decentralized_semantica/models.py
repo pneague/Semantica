@@ -21,6 +21,7 @@ class Endpoint:
 
 @dataclass
 class MembershipManifest:
+    """Legacy v1 manifest retained only for reading reference runs."""
     epoch: str
     seed: int
     peers: Dict[int, Endpoint]
@@ -42,6 +43,40 @@ class MembershipManifest:
             epoch=str(value["epoch"]),
             seed=int(value["seed"]),
             peers={int(peer): Endpoint.from_wire(endpoint) for peer, endpoint in value["peers"].items()},
+            parameters=dict(value["parameters"]),
+        )
+
+
+@dataclass(frozen=True)
+class BootstrapConfig:
+    """Public runtime configuration containing one bootstrap endpoint, not membership."""
+
+    epoch: str
+    seed: int
+    root_peer_id: int
+    root_endpoint: Endpoint
+    parameters: Dict[str, Any]
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "schema": "decentralized_semantica_bootstrap_v2",
+            "implementation": "port_based_decentralized_semantica_v2",
+            "epoch": self.epoch,
+            "seed": int(self.seed),
+            "root_peer_id": int(self.root_peer_id),
+            "root_endpoint": self.root_endpoint.to_wire(),
+            "parameters": dict(self.parameters),
+        }
+
+    @classmethod
+    def from_wire(cls, value: Mapping[str, Any]) -> "BootstrapConfig":
+        if "peers" in value or "peer_ids" in value:
+            raise ValueError("Bootstrap configuration must not contain a peer list")
+        return cls(
+            epoch=str(value["epoch"]),
+            seed=int(value["seed"]),
+            root_peer_id=int(value["root_peer_id"]),
+            root_endpoint=Endpoint.from_wire(value["root_endpoint"]),
             parameters=dict(value["parameters"]),
         )
 

@@ -154,6 +154,28 @@ def custodian_for(node_id: str, manifest: MembershipManifest) -> int:
     )
 
 
+def custodian_for_peers(node_id: str, epoch: str, peer_ids: Iterable[int]) -> int:
+    """Rendezvous-select from a discovered runtime registry.
+
+    The caller pins the returned assignment. Later joins therefore cannot move
+    an existing tree node to another custodian.
+    """
+    candidates = {int(peer_id) for peer_id in peer_ids}
+    if not candidates:
+        raise ValueError("Cannot select a custodian from an empty registry")
+    return max(
+        candidates,
+        key=lambda peer_id: (
+            hashlib.sha256(
+                str(epoch).encode("utf-8")
+                + str(node_id).encode("ascii")
+                + str(peer_id).encode("ascii")
+            ).digest(),
+            -peer_id,
+        ),
+    )
+
+
 def split_entries(
     entries: Sequence[CentroidEntry],
     *,

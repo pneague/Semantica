@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import traceback
@@ -14,7 +15,7 @@ from .algorithms import (
     assign_unique_candidates,
     child_node_id,
     choose_child,
-    custodian_for,
+    custodian_for_peers,
     fit_peer_profile,
     local_topk,
     merge_topk,
@@ -27,13 +28,13 @@ from .algorithms import (
 )
 from .dataset import load_shard
 from .models import (
+    BootstrapConfig,
     ChildDescriptor,
     Contact,
     CentroidEntry,
     Endpoint,
     InternalNode,
     LeafNode,
-    MembershipManifest,
     PeerProfile,
     QueryState,
     TreeNode,
@@ -53,6 +54,17 @@ from .protocol import (
 
 RESPONSE_TYPES = {
     "CONFIGURE": "CONFIGURED",
+    "JOIN": "JOIN_ACK",
+    "PEER_LOOKUP": "PEER_LOOKUP_REPLY",
+    "CUSTODIAN_ASSIGN": "CUSTODIAN_ASSIGN_REPLY",
+    "REGISTRY_STATUS": "REGISTRY_STATUS_REPLY",
+    "ACTIVATE_SYNC": "ACTIVATE_SYNC_ACK",
+    "SYNC_LINK": "SYNC_LINK_ACK",
+    "SYNC_TOKEN": "SYNC_TOKEN_ACK",
+    "SYNC_PHASE_COMPLETE": "SYNC_PHASE_COMPLETE_ACK",
+    "SYNC_PHASE_FAILED": "SYNC_PHASE_FAILED_ACK",
+    "FINALIZE": "FINALIZE_ACK",
+    "TREE_STATS": "TREE_STATS_REPLY",
     "PROFILE_READY": "PROFILE_READY_ACK",
     "BUILD_TURN": "BUILD_DONE",
     "TREE_NODE_GET": "TREE_NODE_REPLY",
@@ -83,6 +95,7 @@ class PeerRuntime:
         endpoint_queue: Any,
         *,
         host: str = "127.0.0.1",
+        bootstrap: Optional[BootstrapConfig] = None,
     ) -> None:
         self.peer_id = int(peer_id)
         self.shard_path = Path(shard_path)
@@ -90,11 +103,37 @@ class PeerRuntime:
         self.endpoint_queue = endpoint_queue
         self.host = str(host)
         self.endpoint = Endpoint(self.host, 0)
-        self.manifest: Optional[MembershipManifest] = None
-        self.epoch = "unconfigured"
-        self.parameters: Dict[str, Any] = {}
+        self.bootstrap: Optional[BootstrapConfig] = bootstrap
+        self.epoch = bootstrap.epoch if bootstrap else "unconfigured"
+        self.parameters: Dict[str, Any] = (
+            dict(bootstrap.parameters) if bootstrap else {}
+        )
+        self.endpoint_cache: Dict[int, Endpoint] = {}
+        if bootstrap is not None:
+            self.endpoint_cache[int(bootstrap.root_peer_id)] = bootstrap.root_endpoint
+        self.registry: Dict[int, Endpoint] = {}
+        self.join_order: List[int] = []
+        self.join_positions: Dict[int, int] = {}
+        self.custodian_ready: set[int] = set()
+        self.custodian_assignments: Dict[str, int] = {}
+        self.initial_cohort: List[int] = []
+        self.tree_joined: set[int] = set()
+        self.active_peers: set[int] = set()
+        self.sync_next_peer_id: Optional[int] = None
+        self.sync_next_endpoint: Optional[Endpoint] = None
+        self.sync_position: Optional[int] = None
+        self.sync_size = 0
+        self.sync_phase_waiters: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+        self.seen_sync_tokens: set[str] = set()
+        self.background_tasks: set[asyncio.Task[Any]] = set()
+        self.admission_lock = asyncio.Lock()
+        self.admission_task: Optional[asyncio.Task[None]] = None
+        self.finalize_task: Optional[asyncio.Task[None]] = None
+        self.checkpoint_state_on_active = False
+        self.fatal_exception: Optional[BaseException] = None
         self.shard = load_shard(self.shard_path)
         self.profile: Optional[PeerProfile] = None
+        self.inserted_profile = False
         self.profile_cache: Dict[int, PeerProfile] = {}
         self.nodes: Dict[str, TreeNode] = {}
         self.node_locks: Dict[str, asyncio.Lock] = {}
@@ -104,8 +143,7 @@ class PeerRuntime:
         self.query_states: Dict[str, QueryState] = {}
         self.query_events: Dict[str, asyncio.Event] = {}
         self.profile_ready: set[int] = set()
-        self.phase = "STARTING"
-        self.frozen = False
+        self.phase = "STARTING" if bootstrap is None else "BOOTSTRAP"
         self.stop_event = asyncio.Event()
         self.coordinator_task: Optional[asyncio.Task[None]] = None
         self.phase_timings: Dict[str, float] = {}
@@ -119,15 +157,25 @@ class PeerRuntime:
 
     @property
     def root_id(self) -> str:
-        if self.manifest is None:
+        if self.bootstrap is None:
             raise RuntimeError("Peer has not been configured")
-        return root_node_id(self.manifest.epoch)
+        return root_node_id(self.bootstrap.epoch)
 
     @property
     def root_peer_id(self) -> int:
-        if self.manifest is None:
+        if self.bootstrap is None:
             raise RuntimeError("Peer has not been configured")
-        return custodian_for(self.root_id, self.manifest)
+        return int(self.bootstrap.root_peer_id)
+
+    @property
+    def root_endpoint(self) -> Endpoint:
+        if self.bootstrap is None:
+            raise RuntimeError("Peer has not been configured")
+        return self.bootstrap.root_endpoint
+
+    @property
+    def is_root(self) -> bool:
+        return self.bootstrap is not None and self.peer_id == self.root_peer_id
 
     def _log(self, direction: str, message: Mapping[str, Any], target: Endpoint, size: int) -> None:
         payload = message.get("payload", {})
@@ -157,6 +205,8 @@ class PeerRuntime:
             "round": payload.get("round"),
             "query_id": payload.get("query_id"),
             "hop": payload.get("hop"),
+            "sync_phase_key": payload.get("phase_key"),
+            "sync_position": payload.get("position"),
         }
         self.log_handle.write(json.dumps(row, sort_keys=True) + "\n")
         self.log_handle.flush()
@@ -164,14 +214,9 @@ class PeerRuntime:
     def _peer_id_for_endpoint(self, endpoint: Endpoint) -> Optional[int]:
         if endpoint == self.endpoint:
             return self.peer_id
-        if self.manifest is None:
-            return None
+        candidates = self.registry if self.is_root else self.endpoint_cache
         return next(
-            (
-                peer_id
-                for peer_id, member_endpoint in self.manifest.peers.items()
-                if member_endpoint == endpoint
-            ),
+            (peer_id for peer_id, member_endpoint in candidates.items() if member_endpoint == endpoint),
             None,
         )
 
@@ -185,11 +230,23 @@ class PeerRuntime:
         )
 
     async def rpc(self, peer_id: int, message_type: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
-        if self.manifest is None:
-            raise RuntimeError("Peer has not been configured")
-        return await self._rpc_client().call(
-            self.manifest.peers[int(peer_id)], message_type, payload
+        endpoint = await self._resolve_peer(int(peer_id))
+        return await self._rpc_client().call(endpoint, message_type, payload)
+
+    async def _resolve_peer(self, peer_id: int) -> Endpoint:
+        peer_id = int(peer_id)
+        if peer_id == self.peer_id:
+            return self.endpoint
+        if self.is_root and peer_id in self.registry:
+            return self.registry[peer_id]
+        if peer_id in self.endpoint_cache:
+            return self.endpoint_cache[peer_id]
+        response = await self.rpc_endpoint(
+            self.root_endpoint, "PEER_LOOKUP", {"peer_id": peer_id}
         )
+        endpoint = Endpoint.from_wire(response["payload"]["endpoint"])
+        self.endpoint_cache[peer_id] = endpoint
+        return endpoint
 
     async def rpc_endpoint(
         self, endpoint: Endpoint, message_type: str, payload: Mapping[str, Any]
@@ -200,7 +257,12 @@ class PeerRuntime:
         self.server = await asyncio.start_server(self._handle_client, self.host, 0)
         socket = self.server.sockets[0]
         self.endpoint = Endpoint(str(socket.getsockname()[0]), int(socket.getsockname()[1]))
-        self.endpoint_queue.put((self.peer_id, self.endpoint.host, self.endpoint.port))
+        if self.endpoint_queue is not None:
+            self.endpoint_queue.put(
+                ("LISTENING", self.peer_id, self.endpoint.host, self.endpoint.port)
+            )
+        if self.bootstrap is not None:
+            self.profile_task = self._spawn_background(self._join_and_initialize())
         async with self.server:
             await self.stop_event.wait()
         self.server.close()
@@ -212,6 +274,32 @@ class PeerRuntime:
             await self.profile_task
         if self.coordinator_task is not None:
             await self.coordinator_task
+        if self.fatal_exception is not None:
+            raise self.fatal_exception
+
+    def _spawn_background(self, awaitable: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(awaitable)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(self._background_task_finished)
+        return task
+
+    def _background_task_finished(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None:
+            return
+        self.fatal_exception = exception
+        if self.is_root:
+            for waiter in self.sync_phase_waiters.values():
+                if not waiter.done():
+                    waiter.set_exception(exception)
+        (self.run_dir / "errors").mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "errors" / f"peer_{self.peer_id:05d}_fatal.log").write_text(
+            "".join(traceback.format_exception(exception)), encoding="utf-8"
+        )
+        self.stop_event.set()
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -270,35 +358,34 @@ class PeerRuntime:
         return RESPONSE_TYPES[message_type], dict(payload or {})
 
     async def _on_configure(self, payload: Dict[str, Any], _request: Mapping[str, Any]) -> Dict[str, Any]:
-        if self.manifest is not None:
+        if self.bootstrap is not None:
             return {"peer_id": self.peer_id, "already_configured": True}
-        self.manifest = MembershipManifest.from_wire(payload["membership"])
-        self.epoch = self.manifest.epoch
-        self.parameters = dict(self.manifest.parameters)
-        if self.peer_id not in self.manifest.peers or self.manifest.peers[self.peer_id] != self.endpoint:
-            raise ProtocolError("Membership endpoint does not match listening endpoint")
-        if self.peer_id == self.root_peer_id:
-            self.nodes[self.root_id] = LeafNode(
-                node_id=self.root_id, version=1, depth=0, parent=None
-            )
-        self.phase = "PROFILE"
-        self.profile_task = asyncio.create_task(self._initialize_profile())
-        self.profile_task.add_done_callback(self._profile_task_finished)
+        self.bootstrap = BootstrapConfig.from_wire(payload["bootstrap"])
+        self.epoch = self.bootstrap.epoch
+        self.parameters = dict(self.bootstrap.parameters)
+        if self.peer_id != self.root_peer_id or self.root_endpoint != self.endpoint:
+            raise ProtocolError("CONFIGURE must target the declared root endpoint")
+        self.endpoint_cache[self.peer_id] = self.endpoint
+        self.nodes[self.root_id] = LeafNode(
+            node_id=self.root_id, version=1, depth=0, parent=None
+        )
+        self.custodian_assignments[self.root_id] = self.peer_id
+        self.phase = "BOOTSTRAP"
+        self.profile_task = self._spawn_background(self._join_and_initialize())
         return {"peer_id": self.peer_id, "root_peer_id": self.root_peer_id}
 
-    def _profile_task_finished(self, task: asyncio.Task[None]) -> None:
-        if task.cancelled():
-            return
-        exception = task.exception()
-        if exception is None:
-            return
-        (self.run_dir / "errors").mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "errors" / f"peer_{self.peer_id:05d}_fatal.log").write_text(
-            "".join(traceback.format_exception(exception)), encoding="utf-8"
+    async def _join_and_initialize(self) -> None:
+        response = await self.rpc_endpoint(
+            self.root_endpoint,
+            "JOIN",
+            {"peer_id": self.peer_id, "endpoint": self.endpoint.to_wire()},
         )
-        self.stop_event.set()
-
-    async def _initialize_profile(self) -> None:
+        if int(response["payload"]["peer_id"]) != self.peer_id:
+            raise ProtocolError("Root acknowledged the wrong joining peer")
+        if self.endpoint_queue is not None:
+            self.endpoint_queue.put(
+                ("JOINED", self.peer_id, self.endpoint.host, self.endpoint.port)
+            )
         start = time.monotonic()
         self.profile = await asyncio.to_thread(
             fit_peer_profile,
@@ -316,92 +403,506 @@ class PeerRuntime:
             "PROFILE_READY",
             {"peer_id": self.peer_id, "centroid_count": len(self.profile.centroids)},
         )
+        if self.endpoint_queue is not None:
+            self.endpoint_queue.put(
+                ("READY", self.peer_id, self.endpoint.host, self.endpoint.port)
+            )
 
-    async def _on_profile_ready(
+    def _require_root(self) -> None:
+        if not self.is_root:
+            raise ProtocolError("Message must be handled by the root custodian")
+
+    def _append_join_event(self, event: str, peer_id: int) -> None:
+        with (self.run_dir / "join_events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "time": time.time(),
+                        "event": str(event),
+                        "peer_id": int(peer_id),
+                        "phase": self.phase,
+                        "join_position": self.join_positions.get(int(peer_id)),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    async def _on_join(
+        self, payload: Dict[str, Any], request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        if self.phase == "FINALIZING":
+            raise ProtocolError("The overlay is finalizing")
+        peer_id = int(payload["peer_id"])
+        endpoint = Endpoint.from_wire(payload["endpoint"])
+        if peer_id != int(request["source_peer_id"]):
+            raise ProtocolError("JOIN peer ID differs from the envelope source")
+        if endpoint != Endpoint.from_wire(request["source_endpoint"]):
+            raise ProtocolError("JOIN endpoint differs from the envelope source")
+        existing = self.registry.get(peer_id)
+        if existing is not None:
+            if existing != endpoint:
+                raise ProtocolError(f"Peer ID {peer_id} is already registered")
+            return {
+                "peer_id": peer_id,
+                "join_position": self.join_positions[peer_id],
+                "already_registered": True,
+            }
+        if endpoint in self.registry.values():
+            raise ProtocolError("Listening endpoint is already registered to another peer")
+        self.registry[peer_id] = endpoint
+        self.endpoint_cache[peer_id] = endpoint
+        self.join_positions[peer_id] = len(self.join_order)
+        self.join_order.append(peer_id)
+        # A peer admitted while the compatibility token is in flight may
+        # serve ordinary RPCs, but it must not affect synchronous custody.
+        # The complete queued set becomes eligible only after ACTIVE.
+        if self.phase in {"BOOTSTRAP", "ACTIVE"}:
+            self.custodian_ready.add(peer_id)
+        self._append_join_event("registered", peer_id)
+        return {
+            "peer_id": peer_id,
+            "join_position": self.join_positions[peer_id],
+            "already_registered": False,
+        }
+
+    async def _on_peer_lookup(
         self, payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
-        if self.peer_id != self.root_peer_id:
-            raise ProtocolError("PROFILE_READY was not sent to the root custodian")
-        self.profile_ready.add(int(payload["peer_id"]))
-        if len(self.profile_ready) == len(self.manifest.peers) and self.coordinator_task is None:
-            self.coordinator_task = asyncio.create_task(self._coordinate_protocol())
+        self._require_root()
+        peer_id = int(payload["peer_id"])
+        if peer_id not in self.registry:
+            raise ProtocolError(f"Unknown peer ID: {peer_id}")
+        return {"peer_id": peer_id, "endpoint": self.registry[peer_id].to_wire()}
+
+    async def _on_custodian_assign(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        node_id = str(payload["node_id"])
+        if node_id == self.root_id:
+            custodian = self.root_peer_id
+        elif node_id in self.custodian_assignments:
+            custodian = self.custodian_assignments[node_id]
+        else:
+            custodian = custodian_for_peers(
+                node_id, self.epoch, self.custodian_ready
+            )
+            self.custodian_assignments[node_id] = custodian
+        return {
+            "node_id": node_id,
+            "custodian_peer_id": custodian,
+            "custodian_endpoint": self.registry[custodian].to_wire(),
+        }
+
+    async def _on_registry_status(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        requested = payload.get("peer_id")
+        return {
+            "phase": self.phase,
+            "registered_count": len(self.registry),
+            "ready_count": len(self.profile_ready),
+            "tree_joined_count": len(self.tree_joined),
+            "active_count": len(self.active_peers),
+            "peer_registered": (
+                int(requested) in self.registry if requested is not None else None
+            ),
+            "peer_ready": (
+                int(requested) in self.profile_ready if requested is not None else None
+            ),
+        }
+
+    async def _on_profile_ready(
+        self, payload: Dict[str, Any], request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        peer_id = int(payload["peer_id"])
+        if peer_id != int(request["source_peer_id"]) or peer_id not in self.registry:
+            raise ProtocolError("PROFILE_READY source is not a registered peer")
+        self.profile_ready.add(peer_id)
+        self._append_join_event("profile_ready", peer_id)
+        if self.phase == "ACTIVE":
+            self._ensure_admission_task()
         return {"ready_count": len(self.profile_ready)}
 
-    async def _coordinate_protocol(self) -> None:
-        assert self.manifest is not None
+    async def _on_activate_sync(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        if self.phase != "BOOTSTRAP":
+            raise ProtocolError(f"Cannot activate from phase {self.phase}")
+        expected_count = int(payload["cohort_size"])
+        if len(self.registry) < expected_count:
+            raise ProtocolError(
+                f"Registered peer count {len(self.registry)} < {expected_count}"
+            )
+        initial_cohort = sorted(self.registry)[:expected_count]
+        if not set(initial_cohort).issubset(self.profile_ready):
+            missing = sorted(set(initial_cohort).difference(self.profile_ready))
+            raise ProtocolError(f"Profiles are not ready: {missing}")
+        # Process creation is issued in centralized order, but operating-system
+        # startup can complete out of order. The compatibility cohort is
+        # therefore canonicalized by staged peer position before token links
+        # are installed. No peer receives this complete ordering.
+        self.initial_cohort = initial_cohort
+        self.join_order = list(self.initial_cohort)
+        self.join_order.extend(
+            peer_id for peer_id in sorted(self.registry) if peer_id not in self.initial_cohort
+        )
+        self.join_positions = {
+            peer_id: position for position, peer_id in enumerate(self.join_order)
+        }
+        self.custodian_ready = set(self.initial_cohort)
+        self.checkpoint_state_on_active = bool(payload.get("checkpoint_state", False))
+        self.phase = "SYNC_BUILD"
+        self.coordinator_task = self._spawn_background(self._coordinate_protocol())
+        return {"cohort_size": expected_count, "first_peer_id": self.initial_cohort[0]}
+
+    async def _on_sync_link(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self.sync_position = int(payload["position"])
+        self.sync_size = int(payload["cohort_size"])
+        raw_next = payload.get("next")
+        if raw_next is None:
+            self.sync_next_peer_id = None
+            self.sync_next_endpoint = None
+        else:
+            self.sync_next_peer_id = int(raw_next["peer_id"])
+            self.sync_next_endpoint = Endpoint.from_wire(raw_next["endpoint"])
+            self.endpoint_cache[self.sync_next_peer_id] = self.sync_next_endpoint
+        return {"peer_id": self.peer_id, "position": self.sync_position}
+
+    async def _on_sync_token(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        token_id = str(payload["token_id"])
+        if token_id in self.seen_sync_tokens:
+            return {"token_id": token_id, "duplicate": True}
+        if self.sync_position is None or int(payload["position"]) != self.sync_position:
+            raise ProtocolError("Synchronization token arrived at the wrong peer")
+        self.seen_sync_tokens.add(token_id)
+        self._spawn_background(self._process_sync_token(dict(payload)))
+        return {"token_id": token_id, "accepted": True}
+
+    async def _process_sync_token(self, token: Dict[str, Any]) -> None:
         try:
-            self.phase = "TREE_BUILD"
-            started = time.monotonic()
-            for peer_id in sorted(self.manifest.peers):
-                await self.rpc(peer_id, "BUILD_TURN", {"peer_id": peer_id})
-            self.phase_timings["tree_build_seconds"] = time.monotonic() - started
-            frozen = await asyncio.gather(
-                *(self.rpc(peer_id, "TREE_FROZEN", {}) for peer_id in sorted(self.manifest.peers))
-            )
-            maximum_tree_depth = max(
-                int(response["payload"]["maximum_local_depth"]) for response in frozen
-            )
-            self.phase = "ROUND0"
-            started = time.monotonic()
-            await asyncio.gather(
-                *(
-                    self.rpc(
-                        peer_id,
-                        "ROUND0_START",
-                        {"maximum_tree_depth": maximum_tree_depth},
-                    )
-                    for peer_id in sorted(self.manifest.peers)
+            phase = str(token["phase"])
+            if phase == "BUILD":
+                await self._perform_build()
+            elif phase == "STATS":
+                token["maximum_tree_depth"] = max(
+                    int(token.get("maximum_tree_depth", 0)), self._maximum_local_depth()
                 )
+            elif phase == "ROUND0":
+                self.phase = "SYNC_ORGANIZE"
+                await self._build_round0(int(token["maximum_tree_depth"]))
+            elif phase == "EXPANSION":
+                self.phase = "SYNC_ORGANIZE"
+                await self._expand_round(int(token["round"]))
+            elif phase == "QUERY":
+                self.phase = "SYNC_ORGANIZE"
+                await self._run_local_query()
+                if bool(token.get("checkpoint_state", False)):
+                    await self._export_state()
+            elif phase == "EXPORT":
+                await self._export_state()
+            else:
+                raise ProtocolError(f"Unknown synchronization phase: {phase}")
+            next_token = dict(token)
+            next_token["position"] = int(token["position"]) + 1
+            if self.sync_next_endpoint is not None:
+                await self.rpc_endpoint(self.sync_next_endpoint, "SYNC_TOKEN", next_token)
+            else:
+                await self.rpc_endpoint(
+                    self.root_endpoint,
+                    "SYNC_PHASE_COMPLETE",
+                    {
+                        "phase_key": str(token["phase_key"]),
+                        "token_id": str(token["token_id"]),
+                        "maximum_tree_depth": int(token.get("maximum_tree_depth", 0)),
+                    },
+                )
+        except Exception as exc:
+            if not self.is_root:
+                with contextlib.suppress(Exception):
+                    await self.rpc_endpoint(
+                        self.root_endpoint,
+                        "SYNC_PHASE_FAILED",
+                        {
+                            "phase_key": str(token["phase_key"]),
+                            "peer_id": self.peer_id,
+                            "error": str(exc),
+                        },
+                    )
+            raise
+
+    async def _on_sync_phase_complete(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        key = str(payload["phase_key"])
+        waiter = self.sync_phase_waiters.get(key)
+        if waiter is None or waiter.done():
+            raise ProtocolError(f"No synchronization phase is waiting for {key}")
+        waiter.set_result(dict(payload))
+        return {"phase_key": key}
+
+    async def _on_sync_phase_failed(
+        self, payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        key = str(payload["phase_key"])
+        waiter = self.sync_phase_waiters.get(key)
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(
+                ProtocolError(
+                    f"Sync phase {key} failed at peer {int(payload['peer_id'])}: "
+                    f"{payload['error']}"
+                )
+            )
+        return {"phase_key": key}
+
+    async def _configure_sync_links(self) -> None:
+        for position, peer_id in enumerate(self.initial_cohort):
+            next_value = None
+            if position + 1 < len(self.initial_cohort):
+                next_peer = self.initial_cohort[position + 1]
+                next_value = {
+                    "peer_id": next_peer,
+                    "endpoint": self.registry[next_peer].to_wire(),
+                }
+            await self.rpc(
+                peer_id,
+                "SYNC_LINK",
+                {
+                    "position": position,
+                    "cohort_size": len(self.initial_cohort),
+                    "next": next_value,
+                },
+            )
+
+    async def _run_sync_phase(
+        self, phase: str, *, round_index: Optional[int] = None, **payload: Any
+    ) -> Dict[str, Any]:
+        suffix = "" if round_index is None else f":{int(round_index)}"
+        key = f"{phase}{suffix}"
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[Dict[str, Any]] = loop.create_future()
+        self.sync_phase_waiters[key] = waiter
+        token = {
+            "token_id": f"{self.epoch}:{key}",
+            "phase_key": key,
+            "phase": phase,
+            "position": 0,
+            **payload,
+        }
+        if round_index is not None:
+            token["round"] = int(round_index)
+        first_peer = self.initial_cohort[0]
+        await self.rpc(first_peer, "SYNC_TOKEN", token)
+        timeout = float(self.parameters.get("rpc_timeout_seconds", 30.0)) * max(
+            2, len(self.initial_cohort)
+        )
+        try:
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        finally:
+            self.sync_phase_waiters.pop(key, None)
+
+    async def _coordinate_protocol(self) -> None:
+        try:
+            await self._configure_sync_links()
+            self.phase = "SYNC_BUILD"
+            started = time.monotonic()
+            await self._run_sync_phase("BUILD")
+            self.phase_timings["tree_build_seconds"] = time.monotonic() - started
+            stats = await self._run_sync_phase("STATS", maximum_tree_depth=0)
+            maximum_tree_depth = int(stats["maximum_tree_depth"])
+            self.phase = "SYNC_ORGANIZE"
+            started = time.monotonic()
+            await self._run_sync_phase(
+                "ROUND0", maximum_tree_depth=maximum_tree_depth
             )
             self.phase_timings["round0_seconds"] = time.monotonic() - started
             for round_index in range(1, int(self.parameters["expansion_rounds"]) + 1):
-                self.phase = f"EXPANSION_{round_index}"
                 started = time.monotonic()
-                await asyncio.gather(
-                    *(
-                        self.rpc(peer_id, "EXPANSION_START", {"round": round_index})
-                        for peer_id in sorted(self.manifest.peers)
-                    )
-                )
+                await self._run_sync_phase("EXPANSION", round_index=round_index)
                 self.phase_timings[f"expansion_round_{round_index}_seconds"] = (
                     time.monotonic() - started
                 )
-            self.phase = "QUERY"
             started = time.monotonic()
-            await asyncio.gather(
-                *(self.rpc(peer_id, "QUERY_START", {}) for peer_id in sorted(self.manifest.peers))
+            await self._run_sync_phase(
+                "QUERY", checkpoint_state=self.checkpoint_state_on_active
             )
             self.phase_timings["query_seconds"] = time.monotonic() - started
-            self.phase = "EXPORT"
-            await asyncio.gather(
-                *(self.rpc(peer_id, "EXPORT_STATE", {}) for peer_id in sorted(self.manifest.peers))
-            )
-            (self.run_dir / "run_complete.json").write_text(
+            self.tree_joined.update(self.initial_cohort)
+            self.active_peers.update(self.initial_cohort)
+            self.phase = "ACTIVE"
+            self.custodian_ready.update(self.registry)
+            (self.run_dir / "overlay_active.json").write_text(
                 json.dumps(
                     {
-                        "status": "complete",
-                        "root_peer_id": self.peer_id,
+                        "status": "active",
                         "epoch": self.epoch,
-                        "phase_timings": self.phase_timings,
+                        "initial_cohort_size": len(self.initial_cohort),
                     },
                     indent=2,
                     sort_keys=True,
                 ),
                 encoding="utf-8",
             )
-            for peer_id in sorted(self.manifest.peers):
-                if peer_id != self.peer_id:
-                    await self.rpc(peer_id, "SHUTDOWN", {})
-            self.stop_event.set()
+            self._ensure_admission_task()
         except Exception:
-            (self.run_dir / "root_failure.log").write_text(traceback.format_exc(), encoding="utf-8")
+            (self.run_dir / "root_failure.log").write_text(
+                traceback.format_exc(), encoding="utf-8"
+            )
             self.stop_event.set()
             raise
+
+    def _ensure_admission_task(self) -> None:
+        if not self.is_root or self.phase != "ACTIVE":
+            return
+        has_uninserted = any(
+            peer_id in self.profile_ready and peer_id not in self.tree_joined
+            for peer_id in self.join_order
+        )
+        has_organizable = (
+            len(self.tree_joined) - 1 >= int(self.parameters["degree"])
+            and any(
+                peer_id in self.tree_joined and peer_id not in self.active_peers
+                for peer_id in self.join_order
+            )
+        )
+        if not has_uninserted and not has_organizable:
+            return
+        if self.admission_task is None or self.admission_task.done():
+            self.admission_task = self._spawn_background(self._drain_admissions())
+            self.admission_task.add_done_callback(
+                lambda _task: asyncio.get_running_loop().call_soon(
+                    self._ensure_admission_task
+                )
+            )
+
+    async def _drain_admissions(self) -> None:
+        async with self.admission_lock:
+            pending = [
+                peer_id
+                for peer_id in self.join_order
+                if peer_id in self.profile_ready and peer_id not in self.tree_joined
+            ]
+            for peer_id in pending:
+                await self.rpc(peer_id, "BUILD_TURN", {"peer_id": peer_id})
+                self.tree_joined.add(peer_id)
+                self._append_join_event("tree_joined", peer_id)
+            contact_pending = [
+                peer_id
+                for peer_id in self.join_order
+                if peer_id in self.tree_joined and peer_id not in self.active_peers
+            ]
+            for peer_id in contact_pending:
+                if len(self.tree_joined) - 1 < int(self.parameters["degree"]):
+                    self._append_join_event("contacts_pending", peer_id)
+                    continue
+                maximum_depth = 0
+                for candidate in self.join_order:
+                    response = await self.rpc(candidate, "TREE_STATS", {})
+                    maximum_depth = max(
+                        maximum_depth,
+                        int(response["payload"]["maximum_local_depth"]),
+                    )
+                await self.rpc(
+                    peer_id,
+                    "ROUND0_START",
+                    {"maximum_tree_depth": maximum_depth},
+                )
+                for round_index in range(
+                    1, int(self.parameters["expansion_rounds"]) + 1
+                ):
+                    await self.rpc(
+                        peer_id, "EXPANSION_START", {"round": round_index}
+                    )
+                await self.rpc(peer_id, "QUERY_START", {})
+                self.active_peers.add(peer_id)
+                self._append_join_event("active", peer_id)
+
+    async def _on_finalize(
+        self, _payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        self._require_root()
+        if self.phase != "ACTIVE":
+            raise ProtocolError(f"Cannot finalize from phase {self.phase}")
+        if self.finalize_task is None:
+            self.finalize_task = self._spawn_background(self._finalize_protocol())
+        return {"status": "finalizing"}
+
+    async def _finalize_protocol(self) -> None:
+        self.phase = "FINALIZING"
+        if self.admission_task is not None:
+            await self.admission_task
+        await self._run_sync_phase("EXPORT")
+        for peer_id in self.join_order:
+            if peer_id not in self.initial_cohort:
+                await self.rpc(peer_id, "EXPORT_STATE", {})
+        registry_wire = {
+            "schema": "decentralized_semantica_discovered_registry_v2",
+            "epoch": self.epoch,
+            "join_order": list(self.join_order),
+            "peers": {
+                str(peer_id): self.registry[peer_id].to_wire()
+                for peer_id in self.join_order
+            },
+            "initial_cohort": list(self.initial_cohort),
+            "tree_joined": sorted(self.tree_joined),
+            "active_peers": sorted(self.active_peers),
+        }
+        (self.run_dir / "discovered_peer_registry.json").write_text(
+            json.dumps(registry_wire, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (self.run_dir / "custodian_assignments.json").write_text(
+            json.dumps(
+                {
+                    "schema": "decentralized_semantica_custody_v2",
+                    "epoch": self.epoch,
+                    "assignments": dict(sorted(self.custodian_assignments.items())),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        (self.run_dir / "run_complete.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "root_peer_id": self.peer_id,
+                    "epoch": self.epoch,
+                    "phase_timings": self.phase_timings,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        for peer_id in self.join_order:
+            if peer_id != self.peer_id:
+                await self.rpc(peer_id, "SHUTDOWN", {})
+        self.stop_event.set()
 
     async def _on_build_turn(self, payload: Dict[str, Any], _request: Mapping[str, Any]) -> Dict[str, Any]:
         if int(payload["peer_id"]) != self.peer_id or self.profile is None:
             raise ProtocolError("Invalid build turn")
-        self.phase = "TREE_BUILD"
+        await self._perform_build()
+        return {"peer_id": self.peer_id, "inserted": len(self.profile.centroids)}
+
+    async def _perform_build(self) -> None:
+        if self.profile is None:
+            raise ProtocolError("Profile is not ready for tree insertion")
+        if self.inserted_profile:
+            return
+        self.phase = "SYNC_BUILD" if self.sync_position is not None else "ACTIVE"
         for centroid_index, vector in enumerate(self.profile.centroids):
             entry = CentroidEntry(
                 peer_id=self.peer_id,
@@ -411,12 +912,26 @@ class PeerRuntime:
                 endpoint=self.endpoint,
             )
             await self._insert_entry(entry)
-        return {"peer_id": self.peer_id, "inserted": len(self.profile.centroids)}
+        self.inserted_profile = True
 
-    def _descriptor(self, node_id: str, center: Optional[np.ndarray] = None) -> ChildDescriptor:
-        assert self.manifest is not None
-        custodian = custodian_for(node_id, self.manifest)
-        return ChildDescriptor(node_id, custodian, self.manifest.peers[custodian], center=center)
+    async def _descriptor(
+        self, node_id: str, center: Optional[np.ndarray] = None
+    ) -> ChildDescriptor:
+        if node_id == self.root_id:
+            return ChildDescriptor(
+                node_id,
+                self.root_peer_id,
+                self.root_endpoint,
+                center=center,
+            )
+        response = await self.rpc_endpoint(
+            self.root_endpoint, "CUSTODIAN_ASSIGN", {"node_id": node_id}
+        )
+        value = response["payload"]
+        endpoint = Endpoint.from_wire(value["custodian_endpoint"])
+        custodian = int(value["custodian_peer_id"])
+        self.endpoint_cache[custodian] = endpoint
+        return ChildDescriptor(node_id, custodian, endpoint, center=center)
 
     async def _get_node(self, descriptor: ChildDescriptor) -> TreeNode:
         response = await self.rpc_endpoint(
@@ -427,7 +942,7 @@ class PeerRuntime:
         return node_from_wire(response["payload"]["node"])
 
     async def _locate_leaf(self, vector: np.ndarray) -> tuple[ChildDescriptor, LeafNode]:
-        descriptor = self._descriptor(self.root_id)
+        descriptor = await self._descriptor(self.root_id)
         while True:
             node = await self._get_node(descriptor)
             if isinstance(node, LeafNode):
@@ -460,8 +975,6 @@ class PeerRuntime:
     async def _on_centroid_insert(
         self, payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Mapping[str, Any] | tuple[str, Mapping[str, Any]]:
-        if self.frozen:
-            raise ProtocolError("Tree is frozen")
         node_id = str(payload["node_id"])
         lock = self.node_locks.setdefault(node_id, asyncio.Lock())
         async with lock:
@@ -496,9 +1009,9 @@ class PeerRuntime:
         left_center, right_center, left_entries, right_entries = result
         left_id = child_node_id(self.epoch, node.node_id, "left")
         right_id = child_node_id(self.epoch, node.node_id, "right")
-        parent_descriptor = self._descriptor(node.node_id)
-        left = self._descriptor(left_id, left_center)
-        right = self._descriptor(right_id, right_center)
+        parent_descriptor = await self._descriptor(node.node_id)
+        left = await self._descriptor(left_id, left_center)
+        right = await self._descriptor(right_id, right_center)
         await asyncio.gather(
             self.rpc_endpoint(
                 left.custodian_endpoint,
@@ -563,14 +1076,24 @@ class PeerRuntime:
     async def _on_tree_frozen(
         self, _payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
-        self.frozen = True
-        self.phase = "TREE_FROZEN"
+        # Retained as a compatibility RPC; v2 pauses mutation by phase instead
+        # of permanently freezing the tree.
         return {
             "peer_id": self.peer_id,
             "node_count": len(self.nodes),
-            "maximum_local_depth": max(
-                (int(node.depth) for node in self.nodes.values()), default=0
-            ),
+            "maximum_local_depth": self._maximum_local_depth(),
+        }
+
+    def _maximum_local_depth(self) -> int:
+        return max((int(node.depth) for node in self.nodes.values()), default=0)
+
+    async def _on_tree_stats(
+        self, _payload: Dict[str, Any], _request: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "peer_id": self.peer_id,
+            "node_count": len(self.nodes),
+            "maximum_local_depth": self._maximum_local_depth(),
         }
 
     async def _on_leaf_scan(self, payload: Dict[str, Any], _request: Mapping[str, Any]) -> Dict[str, Any]:
@@ -613,7 +1136,7 @@ class PeerRuntime:
     async def _on_round0_start(
         self, payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
-        self.phase = "ROUND0"
+        self.phase = "SYNC_ORGANIZE" if self.sync_position is not None else "ACTIVE"
         await self._build_round0(int(payload["maximum_tree_depth"]))
         return {"peer_id": self.peer_id, "degree": sum(len(v) for v in self.contacts_by_round[0])}
 
@@ -725,7 +1248,7 @@ class PeerRuntime:
         self, payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
         round_index = int(payload["round"])
-        self.phase = f"EXPANSION_{round_index}"
+        self.phase = "SYNC_ORGANIZE" if self.sync_position is not None else "ACTIVE"
         await self._expand_round(round_index)
         return {"peer_id": self.peer_id, "round": round_index}
 
@@ -836,7 +1359,10 @@ class PeerRuntime:
     async def _on_query_start(
         self, _payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
-        self.phase = "QUERY"
+        return await self._run_local_query()
+
+    async def _run_local_query(self) -> Dict[str, Any]:
+        self.phase = "SYNC_ORGANIZE" if self.sync_position is not None else "ACTIVE"
         query_id = str(self.shard["query_id"].item())
         state = QueryState(
             query_id=query_id,
@@ -948,6 +1474,9 @@ class PeerRuntime:
     async def _on_export_state(
         self, _payload: Dict[str, Any], _request: Mapping[str, Any]
     ) -> Dict[str, Any]:
+        return await self._export_state()
+
+    async def _export_state(self) -> Dict[str, Any]:
         state_dir = self.run_dir / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -985,6 +1514,27 @@ def run_peer_process(
     shard_path: str,
     run_dir: str,
     endpoint_queue: Any,
+    bootstrap_wire: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    runtime = PeerRuntime(peer_id, Path(shard_path), Path(run_dir), endpoint_queue)
+    bootstrap = (
+        BootstrapConfig.from_wire(bootstrap_wire)
+        if bootstrap_wire is not None
+        else None
+    )
+    runtime = PeerRuntime(
+        peer_id,
+        Path(shard_path),
+        Path(run_dir),
+        endpoint_queue,
+        bootstrap=bootstrap,
+    )
     asyncio.run(runtime.serve())
+
+
+def run_joining_peer(
+    peer_id: int,
+    shard_path: str,
+    run_dir: str,
+    bootstrap_wire: Mapping[str, Any],
+) -> None:
+    run_peer_process(peer_id, shard_path, run_dir, None, bootstrap_wire)

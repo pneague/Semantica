@@ -1,6 +1,7 @@
 """Port-based decentralized Semantica research prototype."""
 
 from .models import (
+    BootstrapConfig,
     ChildDescriptor,
     Contact,
     CentroidEntry,
@@ -13,6 +14,7 @@ from .models import (
 )
 
 __all__ = [
+    "BootstrapConfig",
     "ChildDescriptor",
     "Contact",
     "CentroidEntry",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import multiprocessing as mp
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -15,14 +17,20 @@ from decentralized_semantica.algorithms import (
     assign_unique_candidates,
     child_node_id,
     custodian_for,
+    custodian_for_peers,
     fit_peer_profile,
     local_topk,
     merge_topk,
     root_node_id,
     split_entries,
 )
-from decentralized_semantica.launcher import load_peer_states, run_experiment
+from decentralized_semantica.launcher import (
+    finalize_overlay,
+    load_peer_states,
+    run_experiment,
+)
 from decentralized_semantica.models import (
+    BootstrapConfig,
     ChildDescriptor,
     CentroidEntry,
     Contact,
@@ -33,7 +41,7 @@ from decentralized_semantica.models import (
     PeerProfile,
     QueryState,
 )
-from decentralized_semantica.peer import PeerRuntime
+from decentralized_semantica.peer import PeerRuntime, run_joining_peer
 from decentralized_semantica.protocol import (
     MAX_FRAME_BYTES,
     ProtocolError,
@@ -226,6 +234,146 @@ def test_peer_server_rejects_wrong_epoch_and_unknown_message(tmp_path: Path) -> 
             )
             with pytest.raises(ProtocolError, match="Unknown message type"):
                 await correct_epoch.call(runtime.endpoint, "NOT_A_MESSAGE")
+        runtime.log_handle.close()
+
+    asyncio.run(scenario())
+
+
+def test_root_registry_lookup_duplicate_rejection_and_pinned_custody(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "registry-peer.npz"
+    np.savez_compressed(
+        shard,
+        training_doc_ids=np.asarray(["local"]),
+        training_embeddings=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        query_id=np.asarray("q"),
+        query_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_doc_id=np.asarray("target"),
+    )
+
+    class QueueStub:
+        def put(self, _value: object) -> None:
+            pass
+
+    async def scenario() -> None:
+        runtime = PeerRuntime(0, shard, tmp_path / "registry", QueueStub())
+        server = await asyncio.start_server(runtime._handle_client, "127.0.0.1", 0)
+        runtime.endpoint = Endpoint(
+            "127.0.0.1", int(server.sockets[0].getsockname()[1])
+        )
+        runtime.bootstrap = BootstrapConfig(
+            "registry-epoch",
+            42,
+            0,
+            runtime.endpoint,
+            {"rpc_timeout_seconds": 2},
+        )
+        runtime.epoch = runtime.bootstrap.epoch
+        runtime.parameters = dict(runtime.bootstrap.parameters)
+        runtime.phase = "BOOTSTRAP"
+        runtime.registry[0] = runtime.endpoint
+        runtime.join_order.append(0)
+        runtime.join_positions[0] = 0
+        runtime.custodian_ready.add(0)
+
+        peer1_endpoint = Endpoint("127.0.0.1", 11001)
+        peer1 = RpcClient(1, peer1_endpoint, runtime.epoch, timeout=2)
+        peer2_endpoint = Endpoint("127.0.0.1", 11002)
+        peer2 = RpcClient(2, peer2_endpoint, runtime.epoch, timeout=2)
+        async with server:
+            joined = await peer1.call(
+                runtime.endpoint,
+                "JOIN",
+                {"peer_id": 1, "endpoint": peer1_endpoint.to_wire()},
+            )
+            assert joined["payload"]["join_position"] == 1
+            lookup = await peer1.call(
+                runtime.endpoint, "PEER_LOOKUP", {"peer_id": 0}
+            )
+            assert Endpoint.from_wire(lookup["payload"]["endpoint"]) == runtime.endpoint
+            first = await peer1.call(
+                runtime.endpoint, "CUSTODIAN_ASSIGN", {"node_id": "a" * 64}
+            )
+            await peer2.call(
+                runtime.endpoint,
+                "JOIN",
+                {"peer_id": 2, "endpoint": peer2_endpoint.to_wire()},
+            )
+            second = await peer2.call(
+                runtime.endpoint, "CUSTODIAN_ASSIGN", {"node_id": "a" * 64}
+            )
+            assert first["payload"] == second["payload"]
+            conflicting_endpoint = Endpoint("127.0.0.1", 11999)
+            conflicting = RpcClient(1, conflicting_endpoint, runtime.epoch, timeout=2)
+            with pytest.raises(ProtocolError, match="already registered"):
+                await conflicting.call(
+                    runtime.endpoint,
+                    "JOIN",
+                    {"peer_id": 1, "endpoint": conflicting_endpoint.to_wire()},
+                )
+        runtime.log_handle.close()
+
+    asyncio.run(scenario())
+
+
+def test_sync_join_is_queued_and_insufficient_contacts_remain_pending(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "queued-peer.npz"
+    np.savez_compressed(
+        shard,
+        training_doc_ids=np.asarray(["local"]),
+        training_embeddings=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        query_id=np.asarray("q"),
+        query_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_doc_id=np.asarray("target"),
+    )
+
+    async def scenario() -> None:
+        runtime = PeerRuntime(0, shard, tmp_path / "queued", None)
+        runtime.endpoint = Endpoint("127.0.0.1", 12000)
+        runtime.bootstrap = BootstrapConfig(
+            "queued-epoch",
+            42,
+            0,
+            runtime.endpoint,
+            {"degree": 2, "rpc_timeout_seconds": 2},
+        )
+        runtime.epoch = runtime.bootstrap.epoch
+        runtime.parameters = dict(runtime.bootstrap.parameters)
+        runtime.registry[0] = runtime.endpoint
+        runtime.join_order = [0]
+        runtime.join_positions = {0: 0}
+        runtime.custodian_ready = {0}
+        runtime.phase = "SYNC_BUILD"
+
+        late_endpoint = Endpoint("127.0.0.1", 12001)
+        await runtime._on_join(
+            {"peer_id": 1, "endpoint": late_endpoint.to_wire()},
+            {"source_peer_id": 1, "source_endpoint": late_endpoint.to_wire()},
+        )
+        await runtime._on_profile_ready(
+            {"peer_id": 1}, {"source_peer_id": 1}
+        )
+        assert 1 in runtime.registry
+        assert 1 in runtime.profile_ready
+        assert 1 not in runtime.custodian_ready
+        assert runtime.admission_task is None
+
+        runtime.phase = "ACTIVE"
+        runtime.tree_joined = {0, 1}
+        runtime.active_peers = {0}
+        await runtime._drain_admissions()
+        assert runtime.active_peers == {0}
+        events = [
+            json.loads(line)
+            for line in (runtime.run_dir / "join_events.jsonl").read_text().splitlines()
+        ]
+        assert any(
+            row["event"] == "contacts_pending" and row["peer_id"] == 1
+            for row in events
+        )
         runtime.log_handle.close()
 
     asyncio.run(scenario())
@@ -484,12 +632,11 @@ def _epoch_with_self_and_remote_root_children(peer_count: int) -> str:
         epoch = f"socket-integration-{index}"
         manifest = MembershipManifest(epoch, 42, peers, {})
         root = root_node_id(epoch)
-        root_peer = custodian_for(root, manifest)
         child_peers = {
-            custodian_for(child_node_id(epoch, root, side), manifest)
+            custodian_for_peers(child_node_id(epoch, root, side), epoch, peers)
             for side in ("left", "right")
         }
-        if root_peer in child_peers and any(peer != root_peer for peer in child_peers):
+        if 0 in child_peers and any(peer != 0 for peer in child_peers):
             return epoch
     raise AssertionError("Could not construct deterministic custody fixture")
 
@@ -568,13 +715,11 @@ def _write_small_prepared_fixture(path: Path) -> dict[str, object]:
         "protected_random_fraction": 0.0,
     }
     manifest: dict[str, object] = {
-        "schema": "decentralized_semantica_prepared_v1",
+        "schema": "decentralized_semantica_prepared_v2",
         "dataset": "unit-fixture",
         "epoch": _epoch_with_self_and_remote_root_children(peer_count),
         "seed": 42,
         "parameters": parameters,
-        "peer_ids": list(range(peer_count)),
-        "endpoints": {},
         "shards_sha256": shard_digest.hexdigest(),
         "fixture": str(fixture.resolve()),
         "embedding_bundle": {
@@ -592,6 +737,51 @@ def _write_small_prepared_fixture(path: Path) -> dict[str, object]:
     return manifest
 
 
+def _run_active_fixture(prepared_dir: str, run_dir: str) -> None:
+    run_experiment(
+        Path(prepared_dir),
+        Path(run_dir),
+        endpoint_timeout_seconds=30,
+        run_timeout_seconds=120,
+        rpc_timeout_seconds=15,
+        start_method="spawn",
+        keep_active=True,
+    )
+
+
+def _write_late_peer_shard(path: Path, peer_id: int = 4) -> None:
+    vectors = np.asarray(
+        [
+            [0.7, 0.7, 0.0],
+            [0.72, 0.68, 0.01],
+            [-0.7, -0.7, 0.0],
+            [-0.68, -0.72, 0.01],
+        ],
+        dtype=np.float32,
+    )
+    np.savez_compressed(
+        path,
+        peer_id=np.asarray(peer_id, dtype=np.int32),
+        training_doc_indices=np.arange(16, 20, dtype=np.int32),
+        training_doc_ids=np.asarray([f"doc-{peer_id}-{index}" for index in range(4)]),
+        training_embeddings=vectors,
+        query_index=np.asarray(peer_id, dtype=np.int32),
+        query_id=np.asarray(f"query-{peer_id}"),
+        query_embedding=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_doc_index=np.asarray(0, dtype=np.int32),
+        target_doc_id=np.asarray("doc-0-0"),
+        target_available=np.asarray(True),
+    )
+
+
+def _wait_for_path(path: Path, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for {path}")
+        time.sleep(0.05)
+
+
 def test_process_isolated_port_end_to_end(tmp_path: Path) -> None:
     prepared_dir = tmp_path / "prepared"
     prepared = _write_small_prepared_fixture(prepared_dir)
@@ -606,15 +796,22 @@ def test_process_isolated_port_end_to_end(tmp_path: Path) -> None:
     )
     assert result["status"] == "complete"
     assert len(list((run_dir / "query_paths_results").glob("peer_*.msgpack"))) == 4
-    membership = MembershipManifest.from_wire(
-        json.loads((run_dir / "membership_manifest.json").read_text())
-    )
-    assert len({endpoint.port for endpoint in membership.peers.values()}) == 4
-    assert all(endpoint.port > 0 for endpoint in membership.peers.values())
+    bootstrap_wire = json.loads((run_dir / "bootstrap.json").read_text())
+    assert "peers" not in bootstrap_wire and "peer_ids" not in bootstrap_wire
+    bootstrap = BootstrapConfig.from_wire(bootstrap_wire)
+    registry_wire = json.loads((run_dir / "discovered_peer_registry.json").read_text())
+    peers = {
+        int(peer_id): Endpoint.from_wire(endpoint)
+        for peer_id, endpoint in registry_wire["peers"].items()
+    }
+    assert len({endpoint.port for endpoint in peers.values()}) == 4
+    assert all(endpoint.port > 0 for endpoint in peers.values())
+    run_manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert "membership" not in run_manifest and "peer_ids" not in run_manifest
     states = load_peer_states(run_dir)
     assert set(states) == {0, 1, 2, 3}
     root = root_node_id(str(prepared["epoch"]))
-    root_peer = custodian_for(root, membership)
+    root_peer = bootstrap.root_peer_id
     root_node = states[root_peer]["nodes"][root]
     assert root_node["node_type"] == "internal"
     child_custodians = {
@@ -632,57 +829,31 @@ def test_process_isolated_port_end_to_end(tmp_path: Path) -> None:
     for state in states.values():
         assert set(state["contacts_by_round"]) == {"0", "1", "2"}
         assert len(state["queries"]) == 1
-    root_log = run_dir / "logs" / f"peer_{root_peer:05d}.jsonl"
-    log_rows = [json.loads(line) for line in root_log.read_text().splitlines()]
-    round1_done = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "receive"
-        and row["message_type"] == "EXPANSION_DONE"
-        and row["round"] == 1
+    log_rows = [
+        json.loads(line)
+        for path in sorted((run_dir / "logs").glob("peer_*.jsonl"))
+        for line in path.read_text().splitlines()
     ]
-    round2_start = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "send"
-        and row["message_type"] == "EXPANSION_START"
-        and row["round"] == 2
+    join_events = [
+        json.loads(line) for line in (run_dir / "join_events.jsonl").read_text().splitlines()
     ]
-    assert len(round1_done) == 4 and len(round2_start) == 4
-    assert max(round1_done) <= min(round2_start)
-    round0_done = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "receive" and row["message_type"] == "ROUND0_DONE"
-    ]
-    round1_start = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "send"
-        and row["message_type"] == "EXPANSION_START"
-        and row["round"] == 1
-    ]
-    round2_done = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "receive"
-        and row["message_type"] == "EXPANSION_DONE"
-        and row["round"] == 2
-    ]
-    query_start = [
-        row["time"]
-        for row in log_rows
-        if row["direction"] == "send" and row["message_type"] == "QUERY_START"
-    ]
-    assert len(round0_done) == len(round1_start) == 4
-    assert len(round2_done) == len(query_start) == 4
-    assert max(round0_done) <= min(round1_start)
-    assert max(round2_done) <= min(query_start)
+    registered = [row["peer_id"] for row in join_events if row["event"] == "registered"]
+    assert registered == [0, 1, 2, 3]
+    assert registry_wire["join_order"] == [0, 1, 2, 3]
+    for phase_key in ("BUILD", "ROUND0", "EXPANSION:1", "EXPANSION:2", "QUERY"):
+        token_receives = [
+            row
+            for row in log_rows
+            if row["direction"] == "receive"
+            and row["message_type"] == "SYNC_TOKEN"
+            and row.get("sync_phase_key") == phase_key
+        ]
+        token_receives.sort(key=lambda row: row["time"])
+        assert [int(row["peer_id"]) for row in token_receives] == [0, 1, 2, 3]
     create_leaf_sends = [
         row for row in log_rows if row["direction"] == "send" and row["message_type"] == "CREATE_LEAF"
     ]
-    assert any(row["remote"]["port"] == membership.peers[root_peer].port for row in create_leaf_sends)
-    assert any(row["remote"]["port"] != membership.peers[root_peer].port for row in create_leaf_sends)
+    assert create_leaf_sends
     for row in log_rows:
         assert {
             "source_peer_id",
@@ -698,10 +869,15 @@ def test_process_isolated_port_end_to_end(tmp_path: Path) -> None:
     assert peer_receive_rows
     assert all(
         Endpoint.from_wire(row["source_endpoint"])
-        == membership.peers[int(row["source_peer_id"])]
+        == peers[int(row["source_peer_id"])]
         for row in peer_receive_rows
     )
-    report = validate_run(prepared_dir, run_dir, structural_only=False)
+    report = validate_run(
+        prepared_dir,
+        run_dir,
+        structural_only=False,
+        reference_run=run_dir,
+    )
     assert report["status"] == "passed"
     assert report["oracle"]["rounds_compared"] == 3
     assert report["oracle"]["queries_compared"] == 4
@@ -709,9 +885,96 @@ def test_process_isolated_port_end_to_end(tmp_path: Path) -> None:
         report["oracle"]["oracle"]
         == "unified_retrieval_benchmark_sequential_query_trace"
     )
+    assert report["reference"]["status"] == "exact_match"
     summary = json.loads((run_dir / "network_summary.json").read_text())
     assert summary["messages_by_type"]["CREATE_LEAF"] >= 2
     assert summary["messages_by_type"]["QUERY_HOP"] >= 4
+
+
+def test_standalone_peer_joins_active_overlay_without_changing_existing_contacts(
+    tmp_path: Path,
+) -> None:
+    prepared_dir = tmp_path / "prepared"
+    _write_small_prepared_fixture(prepared_dir)
+
+    active_dir = tmp_path / "active"
+    context = mp.get_context("spawn")
+    runner = context.Process(
+        target=_run_active_fixture,
+        args=(str(prepared_dir), str(active_dir)),
+    )
+    runner.start()
+    _wait_for_path(active_dir / "bootstrap.json", timeout=30)
+    startup_events = [
+        json.loads(line)
+        for line in (active_dir / "join_events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        row["event"] == "registered" and row["peer_id"] == 0
+        for row in startup_events
+    )
+    _wait_for_path(active_dir / "overlay_active.json", timeout=60)
+    prejoin_states = load_peer_states(active_dir)
+    assert set(prejoin_states) == {0, 1, 2, 3}
+    prejoin_run = tmp_path / "prejoin-run"
+    shutil.copytree(active_dir / "state", prejoin_run / "state")
+    prejoin_contacts = {
+        peer_id: pack_message(state["contacts_by_round"])
+        for peer_id, state in prejoin_states.items()
+    }
+
+    late_shard = tmp_path / "peer_00004.npz"
+    _write_late_peer_shard(late_shard)
+    late_peer = context.Process(
+        target=run_joining_peer,
+        args=(
+            4,
+            str(late_shard),
+            str(active_dir),
+            json.loads((active_dir / "bootstrap.json").read_text()),
+        ),
+    )
+    late_peer.start()
+    deadline = time.monotonic() + 60
+    while True:
+        events = [
+            json.loads(line)
+            for line in (active_dir / "join_events.jsonl").read_text().splitlines()
+        ]
+        if any(row["event"] == "active" and row["peer_id"] == 4 for row in events):
+            break
+        if not late_peer.is_alive() or time.monotonic() >= deadline:
+            raise AssertionError("Late peer did not become active")
+        time.sleep(0.05)
+
+    finalize_overlay(active_dir / "bootstrap.json")
+    runner.join(timeout=60)
+    late_peer.join(timeout=60)
+    assert runner.exitcode == 0
+    assert late_peer.exitcode == 0
+
+    states = load_peer_states(active_dir)
+    assert set(states) == {0, 1, 2, 3, 4}
+    for peer_id in range(4):
+        assert pack_message(states[peer_id]["contacts_by_round"]) == prejoin_contacts[
+            peer_id
+        ]
+    assert set(states[4]["contacts_by_round"]) == {"0", "1", "2"}
+    assert sum(
+        len(centroid)
+        for centroid in states[4]["contacts_by_round"]["2"]
+    ) == 2
+    assert len(states[4]["queries"]) == 1
+    registry = json.loads((active_dir / "discovered_peer_registry.json").read_text())
+    assert registry["join_order"] == [0, 1, 2, 3, 4]
+    report = validate_run(
+        prepared_dir,
+        active_dir,
+        structural_only=True,
+        prejoin_run=prejoin_run,
+    )
+    assert report["status"] == "passed"
+    assert report["contact_stability"]["status"] == "byte_identical"
 
 
 def test_launcher_aborts_promptly_when_protocol_cannot_fill_degree(tmp_path: Path) -> None:

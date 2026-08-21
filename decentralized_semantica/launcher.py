@@ -20,8 +20,8 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 import numpy as np
 import sklearn
 
-from .algorithms import custodian_for, root_node_id
-from .models import Endpoint, MembershipManifest
+from .algorithms import root_node_id
+from .models import BootstrapConfig, Endpoint
 from .peer import run_peer_process
 from .protocol import RpcClient, pack_message, unpack_message
 
@@ -60,28 +60,18 @@ def _runtime_environment() -> Dict[str, Any]:
     }
 
 
-async def _configure_peers(
-    manifest: MembershipManifest,
-    root_peer_id: int,
+async def _launcher_call(
+    bootstrap: BootstrapConfig,
     log_path: Path,
-) -> None:
+    message_type: str,
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
     log_stream = log_path.open("a", encoding="utf-8")
 
     def log(direction: str, message: Mapping[str, Any], target: Endpoint, size: int) -> None:
         source_endpoint = Endpoint.from_wire(message["source_endpoint"])
         destination_endpoint = target if direction == "send" else Endpoint("127.0.0.1", 0)
-        destination_peer_id = (
-            next(
-                (
-                    peer_id
-                    for peer_id, endpoint in manifest.peers.items()
-                    if endpoint == target
-                ),
-                None,
-            )
-            if direction == "send"
-            else -1
-        )
+        destination_peer_id = bootstrap.root_peer_id if direction == "send" else -1
         row = {
             "time": time.time(),
             "direction": direction,
@@ -95,7 +85,7 @@ async def _configure_peers(
             "request_id": message.get("request_id"),
             "bytes": int(size),
             "payload_bytes": len(pack_message(message.get("payload", {}))),
-            "phase": "CONFIGURE",
+            "phase": "LAUNCHER_CONTROL",
         }
         log_stream.write(json.dumps(row, sort_keys=True) + "\n")
         log_stream.flush()
@@ -103,24 +93,26 @@ async def _configure_peers(
     client = RpcClient(
         source_peer_id=-1,
         source_endpoint=Endpoint("127.0.0.1", 0),
-        epoch=manifest.epoch,
-        timeout=float(manifest.parameters.get("rpc_timeout_seconds", 30.0)),
+        epoch=bootstrap.epoch,
+        timeout=float(bootstrap.parameters.get("rpc_timeout_seconds", 30.0)),
         log=log,
     )
-    payload = {"membership": manifest.to_wire()}
     try:
-        # A fast peer may finish profile fitting immediately.  Configure the
-        # root first so every subsequent PROFILE_READY has a live receiver.
-        await client.call(manifest.peers[root_peer_id], "CONFIGURE", payload)
-        await asyncio.gather(
-            *(
-                client.call(endpoint, "CONFIGURE", payload)
-                for peer_id, endpoint in sorted(manifest.peers.items())
-                if peer_id != root_peer_id
-            )
-        )
+        return await client.call(bootstrap.root_endpoint, message_type, payload)
     finally:
         log_stream.close()
+
+
+async def _configure_root(
+    bootstrap: BootstrapConfig,
+    log_path: Path,
+) -> Dict[str, Any]:
+    return await _launcher_call(
+        bootstrap,
+        log_path,
+        "CONFIGURE",
+        {"bootstrap": bootstrap.to_wire()},
+    )
 
 
 def _terminate_processes(processes: Iterable[mp.Process]) -> None:
@@ -131,35 +123,77 @@ def _terminate_processes(processes: Iterable[mp.Process]) -> None:
         process.join(timeout=5.0)
 
 
-def _collect_endpoints(
+def _wait_peer_event(
     endpoint_queue: Any,
     processes: Sequence[mp.Process],
-    expected: int,
+    expected_event: str,
+    expected_peer_id: int,
     timeout_seconds: float,
-) -> Dict[int, Endpoint]:
-    endpoints: Dict[int, Endpoint] = {}
+) -> Endpoint:
     deadline = time.monotonic() + float(timeout_seconds)
-    while len(endpoints) < expected:
+    deferred: list[tuple[Any, ...]] = []
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         try:
-            peer_id, host, port = endpoint_queue.get(timeout=min(1.0, remaining))
+            event = tuple(endpoint_queue.get(timeout=min(1.0, remaining)))
         except queue.Empty:
             failed = [process.exitcode for process in processes if process.exitcode is not None]
             if failed:
-                raise RuntimeError(f"A peer exited before endpoint discovery: {failed}")
+                raise RuntimeError(f"A peer exited during startup: {failed}")
             continue
+        if len(event) != 4:
+            raise RuntimeError(f"Malformed peer startup event: {event!r}")
+        kind, peer_id, host, port = event
+        if str(kind) == str(expected_event) and int(peer_id) == int(expected_peer_id):
+            for value in deferred:
+                endpoint_queue.put(value)
+            return Endpoint(str(host), int(port))
+        deferred.append(event)
+    for value in deferred:
+        endpoint_queue.put(value)
+    raise TimeoutError(
+        f"Peer {expected_peer_id} did not report {expected_event} before timeout"
+    )
+
+
+def _collect_ready_peers(
+    endpoint_queue: Any,
+    processes: Sequence[mp.Process],
+    expected_peer_ids: Sequence[int],
+    timeout_seconds: float,
+) -> None:
+    expected = {int(peer_id) for peer_id in expected_peer_ids}
+    ready: set[int] = set()
+    deadline = time.monotonic() + float(timeout_seconds)
+    while ready != expected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            event = tuple(endpoint_queue.get(timeout=min(1.0, remaining)))
+        except queue.Empty:
+            failed = {
+                process.name: process.exitcode
+                for process in processes
+                if process.exitcode not in (None, 0)
+            }
+            if failed:
+                raise RuntimeError(f"Peer startup failures: {failed}")
+            continue
+        if len(event) != 4:
+            raise RuntimeError(f"Malformed peer startup event: {event!r}")
+        kind, peer_id, _host, _port = event
         peer_id = int(peer_id)
-        if peer_id in endpoints:
-            raise RuntimeError(f"Peer {peer_id} reported its endpoint more than once")
-        endpoints[peer_id] = Endpoint(str(host), int(port))
-    if len(endpoints) != expected:
-        raise TimeoutError(f"Only {len(endpoints)}/{expected} peers reported endpoints")
-    ports = [endpoint.port for endpoint in endpoints.values()]
-    if len(set(ports)) != len(ports):
-        raise RuntimeError("The operating system assigned a duplicate peer port")
-    return endpoints
+        if peer_id not in expected:
+            raise RuntimeError(f"Unexpected peer startup event: {event!r}")
+        if str(kind) == "READY":
+            ready.add(peer_id)
+    if ready != expected:
+        raise TimeoutError(
+            f"Only {len(ready)}/{len(expected)} peers completed profile setup"
+        )
 
 
 def load_peer_states(run_dir: Path) -> Dict[int, Dict[str, Any]]:
@@ -170,19 +204,23 @@ def load_peer_states(run_dir: Path) -> Dict[int, Dict[str, Any]]:
     return states
 
 
-def aggregate_run_outputs(run_dir: Path, manifest: MembershipManifest) -> Dict[str, Any]:
+def aggregate_run_outputs(
+    run_dir: Path, peers: Mapping[int, Endpoint], epoch: str
+) -> Dict[str, Any]:
     run_dir = Path(run_dir)
     states = load_peer_states(run_dir)
-    expected = set(manifest.peers)
+    expected = set(peers)
     if set(states) != expected:
         missing = sorted(expected.difference(states))
         raise RuntimeError(f"Missing exported peer states: {missing}")
 
     profile_offsets = np.zeros(len(states) + 1, dtype=np.int64)
+    profile_begin_by_peer: Dict[int, int] = {}
     centers = []
     counts = []
     caps = []
     for position, peer_id in enumerate(sorted(states)):
+        profile_begin_by_peer[peer_id] = int(profile_offsets[position])
         profile = states[peer_id]["profile"]
         peer_centers = np.asarray(profile["centroids"], dtype=np.float32)
         centers.append(peer_centers)
@@ -216,7 +254,7 @@ def aggregate_run_outputs(run_dir: Path, manifest: MembershipManifest) -> Dict[s
         writer.writeheader()
         for peer_id in sorted(states):
             profile = states[peer_id]["profile"]
-            begin = int(profile_offsets[peer_id])
+            begin = profile_begin_by_peer[peer_id]
             for centroid_index, (count, cap) in enumerate(
                 zip(profile["cluster_doc_counts"], profile["contact_caps"])
             ):
@@ -241,7 +279,7 @@ def aggregate_run_outputs(run_dir: Path, manifest: MembershipManifest) -> Dict[s
                 raise RuntimeError(f"Tree node {node_id} was exported by multiple custodians")
             nodes[node_id] = node
             node_custodians[node_id] = peer_id
-    root_id = root_node_id(manifest.epoch)
+    root_id = root_node_id(epoch)
     canonical_nodes: Dict[str, Dict[str, Any]] = {}
     visited: set[str] = set()
 
@@ -333,6 +371,19 @@ def aggregate_run_outputs(run_dir: Path, manifest: MembershipManifest) -> Dict[s
     }
 
 
+def finalize_overlay(bootstrap_path: Path) -> Dict[str, Any]:
+    bootstrap_path = Path(bootstrap_path).resolve()
+    bootstrap = BootstrapConfig.from_wire(_read_json(bootstrap_path))
+    return asyncio.run(
+        _launcher_call(
+            bootstrap,
+            bootstrap_path.parent / "logs" / "finalizer.jsonl",
+            "FINALIZE",
+            {},
+        )
+    )
+
+
 def run_experiment(
     prepared_dir: Path,
     run_dir: Path,
@@ -341,13 +392,32 @@ def run_experiment(
     run_timeout_seconds: float = 7200.0,
     rpc_timeout_seconds: float = 30.0,
     start_method: str = "spawn",
+    root_peer_id: int | None = None,
+    keep_active: bool = False,
 ) -> Dict[str, Any]:
     prepared_dir = Path(prepared_dir).resolve()
     run_dir = Path(run_dir).resolve()
     prepared = _read_json(prepared_dir / "prepared_manifest.json")
-    peer_ids = [int(value) for value in prepared["peer_ids"]]
+    shard_paths = sorted((prepared_dir / "shards").glob("peer_*.npz"))
+    if not shard_paths:
+        raise FileNotFoundError("Prepared directory contains no private peer shards")
+    peer_ids: list[int] = []
+    shards: Dict[int, Path] = {}
+    for shard in shard_paths:
+        with np.load(shard, allow_pickle=False) as values:
+            peer_id = int(np.asarray(values["peer_id"]).item())
+        if peer_id in shards:
+            raise ValueError(f"Duplicate private shard for peer {peer_id}")
+        peer_ids.append(peer_id)
+        shards[peer_id] = shard
+    peer_ids.sort()
     if peer_ids != list(range(len(peer_ids))):
-        raise ValueError("v1 requires contiguous peer positions 0..N-1")
+        raise ValueError("Synchronous compatibility mode requires peer positions 0..N-1")
+    selected_root = peer_ids[0] if root_peer_id is None else int(root_peer_id)
+    if selected_root != peer_ids[0]:
+        raise ValueError(
+            "Synchronous compatibility mode requires the root to be first in peer order"
+        )
     if (run_dir / "run_manifest.json").exists() or (run_dir / "state").exists():
         raise FileExistsError(f"Run directory already contains a run: {run_dir}")
     for name in ("logs", "errors", "state"):
@@ -360,45 +430,50 @@ def run_experiment(
     processes: list[mp.Process] = []
     started_at = time.time()
     try:
-        for peer_id in peer_ids:
-            shard = prepared_dir / "shards" / f"peer_{peer_id:05d}.npz"
-            if not shard.exists():
-                raise FileNotFoundError(f"Missing private shard: {shard}")
-            process = context.Process(
-                name=f"semantica-peer-{peer_id}",
-                target=run_peer_process,
-                args=(peer_id, str(shard), str(run_dir), endpoint_queue),
-            )
-            process.start()
-            processes.append(process)
-        endpoints = _collect_endpoints(
-            endpoint_queue,
-            processes,
-            len(peer_ids),
-            endpoint_timeout_seconds,
-        )
         parameters = dict(prepared["parameters"])
         parameters["rpc_timeout_seconds"] = float(rpc_timeout_seconds)
-        manifest = MembershipManifest(
+        root_process = context.Process(
+            name=f"semantica-peer-{selected_root}",
+            target=run_peer_process,
+            args=(
+                selected_root,
+                str(shards[selected_root]),
+                str(run_dir),
+                endpoint_queue,
+            ),
+        )
+        root_process.start()
+        processes.append(root_process)
+        root_endpoint = _wait_peer_event(
+            endpoint_queue,
+            processes,
+            "LISTENING",
+            selected_root,
+            endpoint_timeout_seconds,
+        )
+        bootstrap = BootstrapConfig(
             epoch=str(prepared["epoch"]),
             seed=int(prepared["seed"]),
-            peers=endpoints,
+            root_peer_id=selected_root,
+            root_endpoint=root_endpoint,
             parameters=parameters,
         )
-        root_peer_id = custodian_for(root_node_id(manifest.epoch), manifest)
-        runtime_membership = manifest.to_wire()
-        _write_json(run_dir / "membership_manifest.json", runtime_membership)
+        bootstrap_wire = bootstrap.to_wire()
         run_manifest: Dict[str, Any] = {
-            "schema": "decentralized_semantica_run_v1",
-            "implementation": "port_based_decentralized_semantica_v1",
+            "schema": "decentralized_semantica_run_v2",
+            "implementation": "port_based_decentralized_semantica_v2",
             "status": "running",
             "prepared_dir": str(prepared_dir),
             "run_dir": str(run_dir),
             "started_at_unix": started_at,
-            "root_node_id": root_node_id(manifest.epoch),
-            "root_peer_id": root_peer_id,
-            "membership": runtime_membership,
-            "launcher_role": "process_startup_configuration_wait_and_collection_only",
+            "root_node_id": root_node_id(bootstrap.epoch),
+            "root_peer_id": selected_root,
+            "bootstrap": bootstrap_wire,
+            "initial_cohort_size": len(peer_ids),
+            "join_order_policy": "sequential_private_shard_position",
+            "sync_schedule": "successor_token_chain",
+            "keep_active": bool(keep_active),
+            "launcher_role": "root_startup_ordered_peer_start_activation_wait_and_collection_only",
             "prepared_manifest_schema": str(prepared["schema"]),
             "prepared_epoch": str(prepared["epoch"]),
             "prepared_seed": int(prepared["seed"]),
@@ -406,12 +481,62 @@ def run_experiment(
             "prepared_shards_sha256": str(prepared["shards_sha256"]),
             "runtime_environment": _runtime_environment(),
         }
+        launcher_log = run_dir / "logs" / "launcher.jsonl"
+        asyncio.run(_configure_root(bootstrap, launcher_log))
+        _wait_peer_event(
+            endpoint_queue,
+            processes,
+            "JOINED",
+            selected_root,
+            endpoint_timeout_seconds,
+        )
+        # Publish the out-of-band bootstrap only after CONFIGURE has created
+        # the empty root node and the root's own JOIN has been acknowledged.
+        _write_json(run_dir / "bootstrap.json", bootstrap_wire)
         _write_json(run_dir / "run_manifest.json", run_manifest)
+
+        for peer_id in peer_ids[1:]:
+            process = context.Process(
+                name=f"semantica-peer-{peer_id}",
+                target=run_peer_process,
+                args=(
+                    peer_id,
+                    str(shards[peer_id]),
+                    str(run_dir),
+                    endpoint_queue,
+                    bootstrap_wire,
+                ),
+            )
+            process.start()
+            processes.append(process)
+            _wait_peer_event(
+                endpoint_queue,
+                processes,
+                "JOINED",
+                peer_id,
+                endpoint_timeout_seconds,
+            )
+        _collect_ready_peers(
+            endpoint_queue,
+            processes,
+            peer_ids,
+            endpoint_timeout_seconds,
+        )
+
         asyncio.run(
-            _configure_peers(manifest, root_peer_id, run_dir / "logs" / "launcher.jsonl")
+            _launcher_call(
+                bootstrap,
+                launcher_log,
+                "ACTIVATE_SYNC",
+                {
+                    "cohort_size": len(peer_ids),
+                    "checkpoint_state": bool(keep_active),
+                },
+            )
         )
 
         deadline = time.monotonic() + float(run_timeout_seconds)
+        finalized = False
         while True:
             for process in processes:
                 process.join(timeout=0.0)
@@ -424,6 +549,12 @@ def run_experiment(
                 raise RuntimeError(f"Peer process failures: {bad_exit_codes}")
             exited = [process.name for process in processes if process.exitcode is not None]
             run_complete = (run_dir / "run_complete.json").exists()
+            overlay_active = (run_dir / "overlay_active.json").exists()
+            if overlay_active and not keep_active and not finalized:
+                asyncio.run(
+                    _launcher_call(bootstrap, launcher_log, "FINALIZE", {})
+                )
+                finalized = True
             if exited and not run_complete:
                 raise RuntimeError(
                     "Peer processes exited before root completion: " + ", ".join(exited)
@@ -438,7 +569,12 @@ def run_experiment(
             raise TimeoutError(f"Peer processes did not finish before timeout: {alive}")
         if not (run_dir / "run_complete.json").exists():
             raise RuntimeError("Root custodian exited without declaring run completion")
-        aggregate = aggregate_run_outputs(run_dir, manifest)
+        registry_wire = _read_json(run_dir / "discovered_peer_registry.json")
+        peers = {
+            int(peer_id): Endpoint.from_wire(endpoint)
+            for peer_id, endpoint in registry_wire["peers"].items()
+        }
+        aggregate = aggregate_run_outputs(run_dir, peers, bootstrap.epoch)
         run_manifest.update(
             {
                 "status": "complete",

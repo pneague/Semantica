@@ -7,12 +7,9 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
-from .algorithms import (
-    custodian_for,
-)
 from .launcher import load_peer_states
-from .models import Endpoint, MembershipManifest
-from .protocol import unpack_message
+from .models import BootstrapConfig, Endpoint
+from .protocol import pack_message, unpack_message
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -23,30 +20,31 @@ def _validate_run_provenance(
     prepared_dir: Path,
     run_dir: Path,
     prepared: Mapping[str, Any],
-    membership_wire: Mapping[str, Any],
-    manifest: MembershipManifest,
+    bootstrap_wire: Mapping[str, Any],
+    bootstrap: BootstrapConfig,
 ) -> Dict[str, Any]:
-    if prepared.get("schema") != "decentralized_semantica_prepared_v1":
+    if prepared.get("schema") != "decentralized_semantica_prepared_v2":
         raise AssertionError("Unexpected prepared-manifest schema")
-    if membership_wire.get("schema") != "decentralized_semantica_membership_v1":
-        raise AssertionError("Unexpected decentralized membership schema")
-    if membership_wire.get("implementation") != "port_based_decentralized_semantica_v1":
-        raise AssertionError("Membership is not labelled as the decentralized implementation")
-    if manifest.epoch != str(prepared["epoch"]):
+    if "peer_ids" in prepared or "endpoints" in prepared:
+        raise AssertionError("Prepared manifest contains a static peer list")
+    if bootstrap_wire.get("schema") != "decentralized_semantica_bootstrap_v2":
+        raise AssertionError("Unexpected decentralized bootstrap schema")
+    if bootstrap_wire.get("implementation") != "port_based_decentralized_semantica_v2":
+        raise AssertionError("Bootstrap is not labelled as the decentralized implementation")
+    if "peers" in bootstrap_wire or "peer_ids" in bootstrap_wire:
+        raise AssertionError("Bootstrap configuration contains a peer list")
+    if bootstrap.epoch != str(prepared["epoch"]):
         raise AssertionError("Prepared and runtime epochs differ")
-    if manifest.seed != int(prepared["seed"]):
+    if bootstrap.seed != int(prepared["seed"]):
         raise AssertionError("Prepared and runtime seeds differ")
-    runtime_parameters = dict(manifest.parameters)
+    runtime_parameters = dict(bootstrap.parameters)
     rpc_timeout = runtime_parameters.pop("rpc_timeout_seconds", None)
     if rpc_timeout is None or runtime_parameters != dict(prepared["parameters"]):
         raise AssertionError("Prepared and runtime algorithm parameters differ")
 
     digest = hashlib.sha256()
-    peer_ids = [int(value) for value in prepared["peer_ids"]]
-    shard_paths = [
-        prepared_dir / "shards" / f"peer_{peer_id:05d}.npz" for peer_id in peer_ids
-    ]
-    if any(not path.exists() for path in shard_paths):
+    shard_paths = sorted((prepared_dir / "shards").glob("peer_*.npz"))
+    if not shard_paths:
         raise AssertionError("A prepared private shard is missing")
     for path in shard_paths:
         digest.update(path.read_bytes())
@@ -55,9 +53,9 @@ def _validate_run_provenance(
         raise AssertionError("Prepared private-shard digest differs")
 
     run_manifest = _read_json(run_dir / "run_manifest.json")
-    if run_manifest.get("schema") != "decentralized_semantica_run_v1":
+    if run_manifest.get("schema") != "decentralized_semantica_run_v2":
         raise AssertionError("Unexpected decentralized run-manifest schema")
-    if run_manifest.get("implementation") != "port_based_decentralized_semantica_v1":
+    if run_manifest.get("implementation") != "port_based_decentralized_semantica_v2":
         raise AssertionError("Run is not labelled as the decentralized implementation")
     if run_manifest.get("status") != "complete":
         raise AssertionError("Decentralized run manifest is not complete")
@@ -72,16 +70,18 @@ def _validate_run_provenance(
     ):
         if run_manifest.get(field) != expected:
             raise AssertionError(f"Run-manifest provenance field differs: {field}")
-    if run_manifest.get("membership") != dict(membership_wire):
-        raise AssertionError("Run and membership manifests differ")
+    if run_manifest.get("bootstrap") != dict(bootstrap_wire):
+        raise AssertionError("Run and bootstrap configurations differ")
+    if "membership" in run_manifest or "peer_ids" in run_manifest:
+        raise AssertionError("Run manifest contains static membership")
     if not run_manifest.get("runtime_environment"):
         raise AssertionError("Run manifest lacks runtime environment metadata")
     return {
-        "implementation": "port_based_decentralized_semantica_v1",
+        "implementation": "port_based_decentralized_semantica_v2",
         "prepared_schema": str(prepared["schema"]),
-        "membership_schema": str(membership_wire["schema"]),
-        "epoch": manifest.epoch,
-        "seed": manifest.seed,
+        "bootstrap_schema": str(bootstrap_wire["schema"]),
+        "epoch": bootstrap.epoch,
+        "seed": bootstrap.seed,
         "parameters_match": True,
         "shards_sha256": observed_digest,
     }
@@ -123,17 +123,26 @@ def _compare_contact_snapshots(
 def _structural_validation(
     prepared_dir: Path,
     run_dir: Path,
-    manifest: MembershipManifest,
+    bootstrap: BootstrapConfig,
+    registry_wire: Mapping[str, Any],
     states: Mapping[int, Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    parameters = manifest.parameters
-    peer_ids = set(manifest.peers)
+    parameters = bootstrap.parameters
+    peers = {
+        int(peer_id): Endpoint.from_wire(endpoint)
+        for peer_id, endpoint in registry_wire["peers"].items()
+    }
+    custody_wire = _read_json(run_dir / "custodian_assignments.json")
+    assignments = {
+        str(node_id): int(peer_id)
+        for node_id, peer_id in custody_wire["assignments"].items()
+    }
     expected_rounds = set(range(int(parameters["expansion_rounds"]) + 1))
     centroid_entries: List[Tuple[int, int]] = []
     overflows: List[Dict[str, Any]] = []
     node_count = 0
     for peer_id, state in states.items():
-        if Endpoint.from_wire(state["endpoint"]) != manifest.peers[peer_id]:
+        if Endpoint.from_wire(state["endpoint"]) != peers[peer_id]:
             raise AssertionError(f"Peer {peer_id} exported the wrong endpoint")
         profile = state["profile"]
         caps = np.asarray(profile["contact_caps"], dtype=np.int32)
@@ -159,7 +168,7 @@ def _structural_validation(
             for centroid in by_centroid:
                 for contact in centroid:
                     candidate = int(contact["peer_id"])
-                    if Endpoint.from_wire(contact["endpoint"]) != manifest.peers[candidate]:
+                    if Endpoint.from_wire(contact["endpoint"]) != peers[candidate]:
                         raise AssertionError(
                             f"Peer {peer_id} round {round_index} contact {candidate} endpoint differs"
                         )
@@ -194,7 +203,7 @@ def _structural_validation(
             raise AssertionError(f"Peer {peer_id} exported too many merged results")
         for node_id, node in state["nodes"].items():
             node_count += 1
-            expected_custodian = custodian_for(str(node_id), manifest)
+            expected_custodian = assignments.get(str(node_id))
             if expected_custodian != peer_id:
                 raise AssertionError(
                     f"Node {node_id} is on peer {peer_id}, expected {expected_custodian}"
@@ -522,31 +531,178 @@ def _full_oracle_validation(
     }
 
 
+def _assert_exact(actual: Any, expected: Any, context: str) -> None:
+    if isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
+        if not isinstance(actual, np.ndarray) or not isinstance(expected, np.ndarray):
+            raise AssertionError(f"{context}: array type differs")
+        if not np.array_equal(actual, expected):
+            raise AssertionError(f"{context}: array values differ")
+        return
+    if isinstance(actual, Mapping) or isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+            raise AssertionError(f"{context}: mapping type differs")
+        if set(actual) != set(expected):
+            raise AssertionError(f"{context}: mapping keys differ")
+        for key in sorted(actual, key=str):
+            _assert_exact(actual[key], expected[key], f"{context}.{key}")
+        return
+    if isinstance(actual, (list, tuple)) or isinstance(expected, (list, tuple)):
+        if not isinstance(actual, (list, tuple)) or not isinstance(expected, (list, tuple)):
+            raise AssertionError(f"{context}: sequence type differs")
+        if len(actual) != len(expected):
+            raise AssertionError(f"{context}: sequence length differs")
+        for index, (left, right) in enumerate(zip(actual, expected)):
+            _assert_exact(left, right, f"{context}[{index}]")
+        return
+    if actual != expected:
+        raise AssertionError(f"{context}: {actual!r} != {expected!r}")
+
+
+def _profile_algorithm_state(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in profile.items()
+        if key not in {"endpoint"}
+    }
+
+
+def _contacts_algorithm_state(
+    contacts_by_round: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        str(round_index): [
+            [
+                {key: value for key, value in contact.items() if key != "endpoint"}
+                for contact in centroid
+            ]
+            for centroid in by_centroid
+        ]
+        for round_index, by_centroid in contacts_by_round.items()
+    }
+
+
+def _tree_algorithm_state(run_dir: Path) -> Dict[str, Any]:
+    tree = unpack_message((run_dir / "tree_snapshot.msgpack").read_bytes())
+    result: Dict[str, Any] = {}
+    for path, node in tree.items():
+        if node["node_type"] == "leaf":
+            result[path] = {
+                "node_type": "leaf",
+                "depth": int(node["depth"]),
+                "failed_split_size": node.get("failed_split_size"),
+                "entries": sorted(
+                    [
+                        {
+                            "peer_id": int(entry["peer_id"]),
+                            "centroid_index": int(entry["centroid_index"]),
+                            "profile_version": int(entry["profile_version"]),
+                            "vector": entry["vector"],
+                        }
+                        for entry in node["entries"]
+                    ],
+                    key=lambda entry: (entry["peer_id"], entry["centroid_index"]),
+                ),
+            }
+        else:
+            result[path] = {
+                "node_type": "internal",
+                "depth": int(node["depth"]),
+                "left_center": node["left"]["center"],
+                "right_center": node["right"]["center"],
+            }
+    return result
+
+
+def _reference_run_validation(run_dir: Path, reference_run: Path) -> Dict[str, Any]:
+    observed = load_peer_states(run_dir)
+    expected = load_peer_states(reference_run)
+    if not set(expected).issubset(observed):
+        raise AssertionError("Observed run is missing peers from the reference run")
+    for peer_id in sorted(expected):
+        _assert_exact(
+            _profile_algorithm_state(observed[peer_id]["profile"]),
+            _profile_algorithm_state(expected[peer_id]["profile"]),
+            f"peer {peer_id} profile",
+        )
+        _assert_exact(
+            _contacts_algorithm_state(observed[peer_id]["contacts_by_round"]),
+            _contacts_algorithm_state(expected[peer_id]["contacts_by_round"]),
+            f"peer {peer_id} contacts",
+        )
+        _assert_exact(
+            observed[peer_id]["queries"],
+            expected[peer_id]["queries"],
+            f"peer {peer_id} queries",
+        )
+    tree_compared = set(observed) == set(expected)
+    if tree_compared:
+        _assert_exact(
+            _tree_algorithm_state(run_dir),
+            _tree_algorithm_state(reference_run),
+            "canonical tree",
+        )
+    return {
+        "status": "exact_match",
+        "reference_run": str(reference_run),
+        "peers_compared": len(expected),
+        "late_peers_excluded": len(observed) - len(expected),
+        "canonical_tree_compared": tree_compared,
+        "physical_custody_compared": False,
+        "network_totals_compared": False,
+        "float_comparison": "bitwise",
+    }
+
+
+def _contact_stability_validation(
+    run_dir: Path, prejoin_run: Path
+) -> Dict[str, Any]:
+    observed = load_peer_states(run_dir)
+    checkpoint = load_peer_states(prejoin_run)
+    if not checkpoint or not set(checkpoint).issubset(observed):
+        raise AssertionError("Pre-join checkpoint has an invalid peer set")
+    for peer_id in sorted(checkpoint):
+        before = pack_message(checkpoint[peer_id]["contacts_by_round"])
+        after = pack_message(observed[peer_id]["contacts_by_round"])
+        if before != after:
+            raise AssertionError(
+                f"Peer {peer_id} contacts changed after asynchronous admission"
+            )
+    return {
+        "status": "byte_identical",
+        "peers_compared": len(checkpoint),
+        "prejoin_run": str(prejoin_run),
+    }
+
+
 def validate_run(
     prepared_dir: Path,
     run_dir: Path,
     *,
     structural_only: bool = False,
     float32_atol: float = 1e-5,
+    reference_run: Path | None = None,
+    prejoin_run: Path | None = None,
 ) -> Dict[str, Any]:
     prepared_dir = Path(prepared_dir).resolve()
     run_dir = Path(run_dir).resolve()
     prepared = _read_json(prepared_dir / "prepared_manifest.json")
-    membership_wire = _read_json(run_dir / "membership_manifest.json")
-    manifest = MembershipManifest.from_wire(membership_wire)
+    bootstrap_wire = _read_json(run_dir / "bootstrap.json")
+    bootstrap = BootstrapConfig.from_wire(bootstrap_wire)
+    registry_wire = _read_json(run_dir / "discovered_peer_registry.json")
+    registry_peers = {int(peer_id) for peer_id in registry_wire["peers"]}
     states = load_peer_states(run_dir)
-    if set(states) != set(manifest.peers):
-        raise AssertionError("Exported peer state set differs from membership")
+    if set(states) != registry_peers:
+        raise AssertionError("Exported peer state set differs from discovered registry")
     report: Dict[str, Any] = {
-        "schema": "decentralized_semantica_validation_v1",
+        "schema": "decentralized_semantica_validation_v2",
         "status": "running",
         "mode": "structural_only" if structural_only else "full_centralized_oracle",
     }
     report["provenance"] = _validate_run_provenance(
-        prepared_dir, run_dir, prepared, membership_wire, manifest
+        prepared_dir, run_dir, prepared, bootstrap_wire, bootstrap
     )
     report["structural"] = _structural_validation(
-        prepared_dir, run_dir, manifest, states
+        prepared_dir, run_dir, bootstrap, registry_wire, states
     )
     if not structural_only:
         report["oracle"] = _full_oracle_validation(
@@ -555,6 +711,14 @@ def validate_run(
             prepared,
             states,
             atol=float(float32_atol),
+        )
+    if reference_run is not None:
+        report["reference"] = _reference_run_validation(
+            run_dir, Path(reference_run).resolve()
+        )
+    if prejoin_run is not None:
+        report["contact_stability"] = _contact_stability_validation(
+            run_dir, Path(prejoin_run).resolve()
         )
     report["status"] = "passed"
     (run_dir / "validation_report.json").write_text(
