@@ -3,9 +3,22 @@
 
 📄 **Paper**: [arXiv:2502.10151](https://arxiv.org/abs/2502.10151)  
 
+## Decentralized implementation
+
+The repository includes a port-based, membership-free implementation in
+`decentralized_semantica/`. Each peer runs as an isolated process with its own
+TCP port and private shard. Peers join through a root bootstrap endpoint rather
+than receiving a global membership list.
+
+See the **[decentralized usage guide](decentralized_semantica/README.md)** for
+installation, deterministic centralized-parity runs, active late joining,
+validation, Slurm submission, outputs, and tests.
+
 ## 🚧 Work in Progress
 
-This repository implements the **tree construction** and **expansion-round algorithms** from the paper. The main script, `main.py`, handles the execution of these algorithms.
+The legacy `main.py` workflow implements the original in-process tree and
+expansion experiments. The separate `decentralized_semantica` package implements
+the process-isolated TCP version and includes centralized-oracle validation.
 
 ---
 
