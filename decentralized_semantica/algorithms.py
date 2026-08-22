@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import math
+import struct
 import warnings
 from collections import defaultdict
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from threadpoolctl import threadpool_limits
 
-from .models import CentroidEntry, Endpoint, MembershipManifest, PeerProfile
+from .models import (
+    CentroidEntry,
+    CustodyProof,
+    Endpoint,
+    PeerDescriptor,
+    PeerProfile,
+)
 
 
 def stable_int(value: object, bits: int = 63) -> int:
@@ -96,7 +104,10 @@ def fit_peer_profile(
         for k in range(2, capped + 1):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Number of distinct clusters")
-                labels = KMeans(n_clusters=k, random_state=peer_seed, n_init=10).fit_predict(values)
+                with threadpool_limits(limits=1):
+                    labels = KMeans(
+                        n_clusters=k, random_state=peer_seed, n_init=10
+                    ).fit_predict(values)
             unique = np.unique(labels)
             if len(unique) < 2 or len(unique) >= len(values):
                 continue
@@ -104,11 +115,18 @@ def fit_peer_profile(
             if score > best_score:
                 best_score = score
                 selected_k = k
+    # The centralized layout first obtains normalized document rows and then
+    # normalizes again inside its fitting helper. Preserve that second
+    # float32 rounding pass so process-isolated peers are bitwise identical.
+    fit_values = normalize_rows(values)
     if selected_k == 1:
-        centers = normalize_vector(np.mean(values, axis=0)).reshape(1, -1)
-        counts = np.asarray([len(values)], dtype=np.int32)
+        centers = normalize_vector(np.mean(fit_values, axis=0)).reshape(1, -1)
+        counts = np.asarray([len(fit_values)], dtype=np.int32)
     else:
-        model = KMeans(n_clusters=selected_k, random_state=peer_seed, n_init=10).fit(values)
+        with threadpool_limits(limits=1):
+            model = KMeans(
+                n_clusters=selected_k, random_state=peer_seed, n_init=10
+            ).fit(fit_values)
         raw_counts = np.bincount(model.labels_, minlength=selected_k)
         nonempty = np.flatnonzero(raw_counts > 0)
         order = sorted(nonempty.tolist(), key=lambda position: (-int(raw_counts[position]), int(position)))
@@ -138,42 +156,101 @@ def child_node_id(epoch: str, parent_node_id: str, side: str) -> str:
     ).hexdigest()
 
 
-def custodian_for(node_id: str, manifest: MembershipManifest) -> int:
-    if not manifest.peers:
-        raise ValueError("Cannot select a custodian from empty membership")
-    return max(
-        manifest.peers,
-        key=lambda peer_id: (
-            hashlib.sha256(
-                str(manifest.epoch).encode("utf-8")
-                + str(node_id).encode("ascii")
-                + str(int(peer_id)).encode("ascii")
-            ).digest(),
-            -int(peer_id),
-        ),
-    )
+CUSTODY_DOMAIN = b"semantica-custody-v1"
+GENESIS_DOMAIN = b"semantica-genesis-v1"
 
 
-def custodian_for_peers(node_id: str, epoch: str, peer_ids: Iterable[int]) -> int:
-    """Rendezvous-select from a discovered runtime registry.
+def _length_prefixed(value: bytes) -> bytes:
+    return struct.pack(">I", len(value)) + value
 
-    The caller pins the returned assignment. Later joins therefore cannot move
-    an existing tree node to another custodian.
-    """
-    candidates = {int(peer_id) for peer_id in peer_ids}
+
+def custody_digest(
+    epoch: str,
+    node_id: str,
+    custody_seed: int,
+    candidate_peer_ids: Iterable[int],
+) -> str:
+    candidates = tuple(sorted({int(peer_id) for peer_id in candidate_peer_ids}))
     if not candidates:
-        raise ValueError("Cannot select a custodian from an empty registry")
-    return max(
-        candidates,
-        key=lambda peer_id: (
-            hashlib.sha256(
-                str(epoch).encode("utf-8")
-                + str(node_id).encode("ascii")
-                + str(peer_id).encode("ascii")
-            ).digest(),
-            -peer_id,
-        ),
+        raise ValueError("Cannot select a custodian without child owners")
+    if int(custody_seed) < 0:
+        raise ValueError("Custody seed cannot be negative")
+    if any(peer_id < 0 for peer_id in candidates):
+        raise ValueError("Custodian peer IDs must be non-negative")
+    epoch_bytes = str(epoch).encode("utf-8")
+    node_bytes = str(node_id).encode("ascii")
+    candidate_bytes = b"".join(
+        _length_prefixed(struct.pack(">Q", peer_id)) for peer_id in candidates
     )
+    material = (
+        CUSTODY_DOMAIN
+        + epoch_bytes
+        + struct.pack(">Q", int(custody_seed))
+        + node_bytes
+        + candidate_bytes
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
+def custody_proof_for_entries(
+    epoch: str,
+    node_id: str,
+    custody_seed: int,
+    entries: Sequence[CentroidEntry],
+) -> CustodyProof:
+    owners: Dict[int, PeerDescriptor] = {}
+    for entry in entries:
+        descriptor = entry.owner
+        existing = owners.get(descriptor.peer_id)
+        if existing is not None and existing.endpoint != descriptor.endpoint:
+            raise ValueError(
+                f"Peer {descriptor.peer_id} has conflicting child-owner descriptors"
+            )
+        if existing is None or descriptor.profile_version > existing.profile_version:
+            owners[descriptor.peer_id] = descriptor
+    candidates = tuple(sorted(owners))
+    digest = custody_digest(epoch, node_id, custody_seed, candidates)
+    selected_index = int.from_bytes(bytes.fromhex(digest), "big") % len(candidates)
+    custodian = owners[candidates[selected_index]]
+    return CustodyProof(
+        seed=int(custody_seed),
+        candidate_peer_ids=candidates,
+        digest=digest,
+        custodian=custodian,
+    )
+
+
+def genesis_custody_proof(
+    epoch: str, node_id: str, custodian: PeerDescriptor
+) -> CustodyProof:
+    material = (
+        GENESIS_DOMAIN
+        + _length_prefixed(str(epoch).encode("utf-8"))
+        + _length_prefixed(str(node_id).encode("ascii"))
+        + _length_prefixed(struct.pack(">Q", int(custodian.peer_id)))
+    )
+    return CustodyProof(
+        seed=0,
+        candidate_peer_ids=(int(custodian.peer_id),),
+        digest=hashlib.sha256(material).hexdigest(),
+        custodian=custodian,
+    )
+
+
+def verify_custody_proof(
+    epoch: str,
+    node_id: str,
+    custody_seed: int,
+    entries: Sequence[CentroidEntry],
+    proof: CustodyProof,
+) -> bool:
+    try:
+        expected = custody_proof_for_entries(
+            epoch, node_id, custody_seed, entries
+        )
+    except ValueError:
+        return False
+    return expected == proof
 
 
 def split_entries(
@@ -200,9 +277,10 @@ def split_entries(
     weights = np.asarray([len(buckets[key]) for key in keys], dtype=np.float64)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Number of distinct clusters")
-        model = KMeans(n_clusters=2, random_state=int(seed), n_init=10).fit(
-            embeddings, sample_weight=weights
-        )
+        with threadpool_limits(limits=1):
+            model = KMeans(n_clusters=2, random_state=int(seed), n_init=10).fit(
+                embeddings, sample_weight=weights
+            )
     left_center = _normalize_split_center(model.cluster_centers_[0])
     right_center = _normalize_split_center(model.cluster_centers_[1])
     if np.isnan(left_center).any() or np.isnan(right_center).any():
@@ -297,12 +375,26 @@ def local_topk(
     top_k: int = 100,
     *,
     query_is_normalized: bool = False,
+    doc_order_keys: Optional[Sequence[int]] = None,
 ) -> List[Tuple[str, float]]:
     # Preserve the centralized benchmark's exact float32 operation order.
     # Normalizing every document first is mathematically equivalent, but the
     # extra rounding can change which document crosses the top-k boundary when
     # scores are extremely close.
     values = np.asarray(embeddings, dtype=np.float32)
+    ids = np.asarray(doc_ids)
+    if doc_order_keys is not None:
+        keys = np.asarray(doc_order_keys, dtype=np.int64)
+        if keys.shape != (len(values),):
+            raise ValueError("doc_order_keys must contain one value per embedding")
+        # The centralized kernel calls np.unique on the global document
+        # indices before its matrix multiplication.  Reproduce that physical
+        # row order: although row permutation is mathematically irrelevant,
+        # BLAS may choose a different float32 accumulation path for a
+        # differently ordered matrix.
+        _unique_keys, first_positions = np.unique(keys, return_index=True)
+        values = values[first_positions]
+        ids = ids[first_positions]
     norms = np.linalg.norm(values, axis=1)
     norms[~np.isfinite(norms) | (norms <= 0.0)] = 1.0
     query_vector = (
@@ -312,7 +404,7 @@ def local_topk(
     )
     scores = (values @ query_vector) / norms
     ranked = sorted(
-        ((str(doc_id), float(score)) for doc_id, score in zip(doc_ids, scores)),
+        ((str(doc_id), float(score)) for doc_id, score in zip(ids, scores)),
         key=lambda item: (-item[1], item[0]),
     )
     return ranked[: int(top_k)]

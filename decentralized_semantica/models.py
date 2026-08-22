@@ -19,31 +19,65 @@ class Endpoint:
         return cls(host=str(value["host"]), port=int(value["port"]))
 
 
-@dataclass
-class MembershipManifest:
-    """Legacy v1 manifest retained only for reading reference runs."""
-    epoch: str
-    seed: int
-    peers: Dict[int, Endpoint]
-    parameters: Dict[str, Any]
+@dataclass(frozen=True, order=True)
+class PeerDescriptor:
+    peer_id: int
+    host: str
+    port: int
+    profile_version: int = 1
+
+    @property
+    def endpoint(self) -> Endpoint:
+        return Endpoint(self.host, self.port)
 
     def to_wire(self) -> Dict[str, Any]:
         return {
-            "schema": "decentralized_semantica_membership_v1",
-            "implementation": "port_based_decentralized_semantica_v1",
-            "epoch": self.epoch,
-            "seed": int(self.seed),
-            "peers": {str(peer): endpoint.to_wire() for peer, endpoint in self.peers.items()},
-            "parameters": dict(self.parameters),
+            "peer_id": int(self.peer_id),
+            "host": self.host,
+            "port": int(self.port),
+            "profile_version": int(self.profile_version),
         }
 
     @classmethod
-    def from_wire(cls, value: Mapping[str, Any]) -> "MembershipManifest":
+    def from_wire(cls, value: Mapping[str, Any]) -> "PeerDescriptor":
+        # Accept the nested endpoint shape emitted by v1/v2 artifacts.
+        endpoint = value.get("endpoint")
+        if endpoint is not None:
+            host = str(endpoint["host"])
+            port = int(endpoint["port"])
+        else:
+            host = str(value["host"])
+            port = int(value["port"])
         return cls(
-            epoch=str(value["epoch"]),
+            peer_id=int(value["peer_id"]),
+            host=host,
+            port=port,
+            profile_version=int(value.get("profile_version", value.get("version", 1))),
+        )
+
+
+@dataclass(frozen=True)
+class CustodyProof:
+    seed: int
+    candidate_peer_ids: tuple[int, ...]
+    digest: str
+    custodian: PeerDescriptor
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "seed": int(self.seed),
+            "candidate_peer_ids": [int(value) for value in self.candidate_peer_ids],
+            "digest": self.digest,
+            "custodian": self.custodian.to_wire(),
+        }
+
+    @classmethod
+    def from_wire(cls, value: Mapping[str, Any]) -> "CustodyProof":
+        return cls(
             seed=int(value["seed"]),
-            peers={int(peer): Endpoint.from_wire(endpoint) for peer, endpoint in value["peers"].items()},
-            parameters=dict(value["parameters"]),
+            candidate_peer_ids=tuple(int(item) for item in value["candidate_peer_ids"]),
+            digest=str(value["digest"]),
+            custodian=PeerDescriptor.from_wire(value["custodian"]),
         )
 
 
@@ -53,18 +87,24 @@ class BootstrapConfig:
 
     epoch: str
     seed: int
-    root_peer_id: int
-    root_endpoint: Endpoint
+    root: "ChildDescriptor"
     parameters: Dict[str, Any]
+
+    @property
+    def root_peer_id(self) -> int:
+        return self.root.custodian.peer_id
+
+    @property
+    def root_endpoint(self) -> Endpoint:
+        return self.root.custodian.endpoint
 
     def to_wire(self) -> Dict[str, Any]:
         return {
-            "schema": "decentralized_semantica_bootstrap_v2",
-            "implementation": "port_based_decentralized_semantica_v2",
+            "schema": "decentralized_semantica_bootstrap_v3",
+            "implementation": "port_based_fully_decentralized_semantica_v3",
             "epoch": self.epoch,
             "seed": int(self.seed),
-            "root_peer_id": int(self.root_peer_id),
-            "root_endpoint": self.root_endpoint.to_wire(),
+            "root": self.root.to_wire(),
             "parameters": dict(self.parameters),
         }
 
@@ -72,11 +112,25 @@ class BootstrapConfig:
     def from_wire(cls, value: Mapping[str, Any]) -> "BootstrapConfig":
         if "peers" in value or "peer_ids" in value:
             raise ValueError("Bootstrap configuration must not contain a peer list")
+        if "root" in value:
+            root = ChildDescriptor.from_wire(value["root"])
+        else:
+            # Reference-run reader for the v2 bootstrap schema.
+            root_peer_id = int(value["root_peer_id"])
+            endpoint = Endpoint.from_wire(value["root_endpoint"])
+            descriptor = PeerDescriptor(
+                root_peer_id, endpoint.host, endpoint.port, profile_version=1
+            )
+            root = ChildDescriptor(
+                node_id="",
+                custodian=descriptor,
+                custody_seed=0,
+                custody_proof=CustodyProof(0, (root_peer_id,), "legacy-v2", descriptor),
+            )
         return cls(
             epoch=str(value["epoch"]),
             seed=int(value["seed"]),
-            root_peer_id=int(value["root_peer_id"]),
-            root_endpoint=Endpoint.from_wire(value["root_endpoint"]),
+            root=root,
             parameters=dict(value["parameters"]),
         )
 
@@ -89,6 +143,12 @@ class PeerProfile:
     cluster_doc_counts: np.ndarray
     contact_caps: np.ndarray
     version: int = 1
+
+    @property
+    def descriptor(self) -> PeerDescriptor:
+        return PeerDescriptor(
+            self.peer_id, self.endpoint.host, self.endpoint.port, self.version
+        )
 
     def to_wire(self) -> Dict[str, Any]:
         return {
@@ -121,11 +181,18 @@ class CentroidEntry:
     endpoint: Endpoint
 
     @property
+    def owner(self) -> PeerDescriptor:
+        return PeerDescriptor(
+            self.peer_id, self.endpoint.host, self.endpoint.port, self.profile_version
+        )
+
+    @property
     def entry_id(self) -> str:
         return f"{self.peer_id}:{self.profile_version}:{self.centroid_index}"
 
     def to_wire(self) -> Dict[str, Any]:
         return {
+            "owner": self.owner.to_wire(),
             "peer_id": int(self.peer_id),
             "centroid_index": int(self.centroid_index),
             "vector": np.asarray(self.vector, dtype=np.float32),
@@ -135,27 +202,42 @@ class CentroidEntry:
 
     @classmethod
     def from_wire(cls, value: Mapping[str, Any]) -> "CentroidEntry":
+        owner = PeerDescriptor.from_wire(value["owner"]) if "owner" in value else None
         return cls(
-            peer_id=int(value["peer_id"]),
+            peer_id=owner.peer_id if owner is not None else int(value["peer_id"]),
             centroid_index=int(value["centroid_index"]),
             vector=np.asarray(value["vector"], dtype=np.float32),
-            profile_version=int(value["profile_version"]),
-            endpoint=Endpoint.from_wire(value["endpoint"]),
+            profile_version=(
+                owner.profile_version if owner is not None else int(value["profile_version"])
+            ),
+            endpoint=(owner.endpoint if owner is not None else Endpoint.from_wire(value["endpoint"])),
         )
 
 
 @dataclass(frozen=True)
 class ChildDescriptor:
     node_id: str
-    custodian_peer_id: int
-    custodian_endpoint: Endpoint
+    custodian: PeerDescriptor
+    custody_seed: int
+    custody_proof: CustodyProof
     center: Optional[np.ndarray] = field(default=None, compare=False)
+
+    @property
+    def custodian_peer_id(self) -> int:
+        return self.custodian.peer_id
+
+    @property
+    def custodian_endpoint(self) -> Endpoint:
+        return self.custodian.endpoint
 
     def to_wire(self) -> Dict[str, Any]:
         value: Dict[str, Any] = {
             "node_id": self.node_id,
-            "custodian_peer_id": int(self.custodian_peer_id),
-            "custodian_endpoint": self.custodian_endpoint.to_wire(),
+            "custodian": self.custodian.to_wire(),
+            "custodian_peer_id": int(self.custodian.peer_id),
+            "custodian_endpoint": self.custodian.endpoint.to_wire(),
+            "custody_seed": int(self.custody_seed),
+            "custody_proof": self.custody_proof.to_wire(),
         }
         if self.center is not None:
             value["center"] = np.asarray(self.center, dtype=np.float32)
@@ -163,10 +245,28 @@ class ChildDescriptor:
 
     @classmethod
     def from_wire(cls, value: Mapping[str, Any]) -> "ChildDescriptor":
+        if "custodian" in value:
+            custodian = PeerDescriptor.from_wire(value["custodian"])
+        else:
+            endpoint = Endpoint.from_wire(value["custodian_endpoint"])
+            custodian = PeerDescriptor(
+                int(value["custodian_peer_id"]), endpoint.host, endpoint.port, 1
+            )
+        proof = (
+            CustodyProof.from_wire(value["custody_proof"])
+            if "custody_proof" in value
+            else CustodyProof(
+                int(value.get("custody_seed", 0)),
+                (custodian.peer_id,),
+                "legacy-v2",
+                custodian,
+            )
+        )
         return cls(
             node_id=str(value["node_id"]),
-            custodian_peer_id=int(value["custodian_peer_id"]),
-            custodian_endpoint=Endpoint.from_wire(value["custodian_endpoint"]),
+            custodian=custodian,
+            custody_seed=int(value.get("custody_seed", proof.seed)),
+            custody_proof=proof,
             center=(
                 np.asarray(value["center"], dtype=np.float32)
                 if value.get("center") is not None
@@ -181,6 +281,8 @@ class LeafNode:
     version: int
     depth: int
     parent: Optional[ChildDescriptor]
+    custody_seed: int
+    custody_proof: CustodyProof
     entries: List[CentroidEntry] = field(default_factory=list)
     failed_split_size: Optional[int] = None
 
@@ -193,6 +295,8 @@ class LeafNode:
             "version": int(self.version),
             "depth": int(self.depth),
             "parent": self.parent.to_wire() if self.parent else None,
+            "custody_seed": int(self.custody_seed),
+            "custody_proof": self.custody_proof.to_wire(),
             "entry_count": len(self.entries),
             "failed_split_size": self.failed_split_size,
         }
@@ -207,6 +311,8 @@ class LeafNode:
             version=int(value["version"]),
             depth=int(value["depth"]),
             parent=ChildDescriptor.from_wire(value["parent"]) if value.get("parent") else None,
+            custody_seed=int(value.get("custody_seed", 0)),
+            custody_proof=CustodyProof.from_wire(value["custody_proof"]),
             entries=[CentroidEntry.from_wire(entry) for entry in value.get("entries", [])],
             failed_split_size=(
                 int(value["failed_split_size"])
@@ -222,6 +328,8 @@ class InternalNode:
     version: int
     depth: int
     parent: Optional[ChildDescriptor]
+    custody_seed: int
+    custody_proof: CustodyProof
     left: ChildDescriptor
     right: ChildDescriptor
 
@@ -234,6 +342,8 @@ class InternalNode:
             "version": int(self.version),
             "depth": int(self.depth),
             "parent": self.parent.to_wire() if self.parent else None,
+            "custody_seed": int(self.custody_seed),
+            "custody_proof": self.custody_proof.to_wire(),
             "left": self.left.to_wire(),
             "right": self.right.to_wire(),
         }
@@ -245,6 +355,8 @@ class InternalNode:
             version=int(value["version"]),
             depth=int(value["depth"]),
             parent=ChildDescriptor.from_wire(value["parent"]) if value.get("parent") else None,
+            custody_seed=int(value.get("custody_seed", 0)),
+            custody_proof=CustodyProof.from_wire(value["custody_proof"]),
             left=ChildDescriptor.from_wire(value["left"]),
             right=ChildDescriptor.from_wire(value["right"]),
         )
@@ -269,8 +381,15 @@ class Contact:
     profile_version: int
     learned_at: str
 
+    @property
+    def descriptor(self) -> PeerDescriptor:
+        return PeerDescriptor(
+            self.peer_id, self.endpoint.host, self.endpoint.port, self.profile_version
+        )
+
     def to_wire(self) -> Dict[str, Any]:
         return {
+            "peer": self.descriptor.to_wire(),
             "peer_id": int(self.peer_id),
             "score": float(self.score),
             "endpoint": self.endpoint.to_wire(),
@@ -280,11 +399,14 @@ class Contact:
 
     @classmethod
     def from_wire(cls, value: Mapping[str, Any]) -> "Contact":
+        peer = PeerDescriptor.from_wire(value["peer"]) if "peer" in value else None
         return cls(
-            peer_id=int(value["peer_id"]),
+            peer_id=peer.peer_id if peer is not None else int(value["peer_id"]),
             score=float(value["score"]),
-            endpoint=Endpoint.from_wire(value["endpoint"]),
-            profile_version=int(value["profile_version"]),
+            endpoint=peer.endpoint if peer is not None else Endpoint.from_wire(value["endpoint"]),
+            profile_version=(
+                peer.profile_version if peer is not None else int(value["profile_version"])
+            ),
             learned_at=str(value["learned_at"]),
         )
 

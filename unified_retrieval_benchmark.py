@@ -2973,6 +2973,7 @@ def expand_semantica_contacts(
     checkpoint_callback: Optional[
         Callable[[int, Sequence[Sequence[Sequence[Tuple[int, float]]]]], None]
     ] = None,
+    referrer_callback: Optional[Callable[[int, int, int, int], None]] = None,
 ) -> Tuple[List[List[List[Tuple[int, float]]]], List[Dict[str, object]]]:
     replacement_policy = str(replacement_policy)
     if replacement_policy not in EXPANSION_REPLACEMENT_POLICIES:
@@ -3101,6 +3102,13 @@ def expand_semantica_contacts(
                     stable_int(f"semantic-referrer:{seed}:{round_index}:{peer_position}:{centroid_index}")
                 )
                 referrer = int(tier[int(rng.integers(0, len(tier)))])
+                if referrer_callback is not None:
+                    referrer_callback(
+                        int(round_index),
+                        int(peer_position),
+                        int(centroid_index),
+                        int(referrer),
+                    )
                 asked[peer_position][centroid_index].add(referrer)
                 round_counts["semantic_messages"] += 1
                 round_counts["semantic_new_contact_requests" if new_tier else "semantic_initial_contact_requests"] += 1

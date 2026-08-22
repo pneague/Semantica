@@ -19,7 +19,7 @@ def _path(value: str) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m decentralized_semantica",
-        description="Port-based, membership-free decentralized Semantica v2",
+        description="Port-based, custodian-only fully decentralized Semantica v3",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -30,15 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--peer-count", type=int, default=100)
     prepare.add_argument("--seed", type=int, default=42)
 
-    run = commands.add_parser("run", help="Launch one TCP process per prepared peer")
-    run.add_argument("--prepared-dir", type=_path, required=True)
-    run.add_argument("--run-dir", type=_path, required=True)
-    run.add_argument("--endpoint-timeout-seconds", type=float, default=120.0)
-    run.add_argument("--run-timeout-seconds", type=float, default=7200.0)
-    run.add_argument("--rpc-timeout-seconds", type=float, default=30.0)
-    run.add_argument("--root-peer-id", type=int)
-    run.add_argument("--keep-active", action="store_true")
-    run.add_argument(
+    compat = commands.add_parser(
+        "compat-run", help="Run the external ordered centralized-parity experiment"
+    )
+    compat.add_argument("--prepared-dir", type=_path, required=True)
+    compat.add_argument("--run-dir", type=_path, required=True)
+    compat.add_argument("--endpoint-timeout-seconds", type=float, default=120.0)
+    compat.add_argument("--run-timeout-seconds", type=float, default=7200.0)
+    compat.add_argument("--rpc-timeout-seconds", type=float, default=30.0)
+    compat.add_argument("--root-peer-id", type=int)
+    compat.add_argument("--release-active", action="store_true")
+    compat.add_argument(
         "--start-method",
         choices=("spawn", "forkserver", "fork"),
         default="spawn",
@@ -50,9 +52,24 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--prepared-dir", type=_path, required=True)
     validate.add_argument("--run-dir", type=_path, required=True)
     validate.add_argument("--structural-only", action="store_true")
-    validate.add_argument("--float32-atol", type=float, default=1e-5)
+    validate.add_argument(
+        "--float32-atol",
+        type=float,
+        default=0.0,
+        help="Diagnostic override; acceptance uses the default exact comparison",
+    )
     validate.add_argument("--reference-run", type=_path)
     validate.add_argument("--prejoin-run", type=_path)
+
+    start_root = commands.add_parser(
+        "start-root", help="Start the genesis peer as an ordinary seed-0 custodian"
+    )
+    start_root.add_argument("--prepared-dir", type=_path, required=True)
+    start_root.add_argument("--peer-id", type=int, default=0)
+    start_root.add_argument("--shard", type=_path)
+    start_root.add_argument("--run-dir", type=_path, required=True)
+    start_root.add_argument("--bootstrap", type=_path)
+    start_root.add_argument("--rpc-timeout-seconds", type=float, default=30.0)
 
     join = commands.add_parser(
         "join", help="Start an independent peer and join through the root custodian"
@@ -62,10 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--shard", type=_path, required=True)
     join.add_argument("--run-dir", type=_path, required=True)
 
-    finalize = commands.add_parser(
-        "finalize", help="Export state and stop an active decentralized overlay"
-    )
-    finalize.add_argument("--bootstrap", type=_path, required=True)
     return parser
 
 
@@ -80,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             peer_count=arguments.peer_count,
             seed=arguments.seed,
         )
-    elif arguments.command == "run":
+    elif arguments.command == "compat-run":
         from .launcher import run_experiment
 
         result = run_experiment(
@@ -91,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rpc_timeout_seconds=arguments.rpc_timeout_seconds,
             start_method=arguments.start_method,
             root_peer_id=arguments.root_peer_id,
-            keep_active=arguments.keep_active,
+            release_active=arguments.release_active,
         )
     elif arguments.command == "validate":
         from .validation import validate_run
@@ -117,10 +130,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_wire,
         )
         result = {"status": "stopped", "peer_id": arguments.peer_id}
-    elif arguments.command == "finalize":
-        from .launcher import finalize_overlay
+    elif arguments.command == "start-root":
+        from .peer import run_root_peer
 
-        result = finalize_overlay(arguments.bootstrap)["payload"]
+        prepared = json.loads(
+            (arguments.prepared_dir / "prepared_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        shard = arguments.shard or (
+            arguments.prepared_dir / "shards" / f"peer_{arguments.peer_id:05d}.npz"
+        )
+        bootstrap_path = arguments.bootstrap or (arguments.run_dir / "bootstrap.json")
+        parameters = dict(prepared["parameters"])
+        parameters.pop("peer_count", None)
+        parameters["rpc_timeout_seconds"] = float(arguments.rpc_timeout_seconds)
+        parameters["compatibility_mode"] = False
+        run_root_peer(
+            arguments.peer_id,
+            str(shard),
+            str(arguments.run_dir),
+            {
+                "epoch": str(prepared["epoch"]),
+                "seed": int(prepared["seed"]),
+                "parameters": parameters,
+                "bootstrap_path": str(bootstrap_path),
+            },
+        )
+        result = {"status": "stopped", "peer_id": arguments.peer_id}
     else:  # pragma: no cover - argparse enforces the command set.
         raise AssertionError(arguments.command)
     print(json.dumps(result, indent=2, sort_keys=True))

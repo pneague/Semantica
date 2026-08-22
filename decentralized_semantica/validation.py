@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
+from threadpoolctl import threadpool_limits
 
 from .launcher import load_peer_states
-from .models import BootstrapConfig, Endpoint
+from .algorithms import custody_digest, genesis_custody_proof, root_node_id
+from .models import BootstrapConfig, CustodyProof, Endpoint, PeerDescriptor
 from .protocol import pack_message, unpack_message
 
 
@@ -27,9 +29,9 @@ def _validate_run_provenance(
         raise AssertionError("Unexpected prepared-manifest schema")
     if "peer_ids" in prepared or "endpoints" in prepared:
         raise AssertionError("Prepared manifest contains a static peer list")
-    if bootstrap_wire.get("schema") != "decentralized_semantica_bootstrap_v2":
+    if bootstrap_wire.get("schema") != "decentralized_semantica_bootstrap_v3":
         raise AssertionError("Unexpected decentralized bootstrap schema")
-    if bootstrap_wire.get("implementation") != "port_based_decentralized_semantica_v2":
+    if bootstrap_wire.get("implementation") != "port_based_fully_decentralized_semantica_v3":
         raise AssertionError("Bootstrap is not labelled as the decentralized implementation")
     if "peers" in bootstrap_wire or "peer_ids" in bootstrap_wire:
         raise AssertionError("Bootstrap configuration contains a peer list")
@@ -39,7 +41,10 @@ def _validate_run_provenance(
         raise AssertionError("Prepared and runtime seeds differ")
     runtime_parameters = dict(bootstrap.parameters)
     rpc_timeout = runtime_parameters.pop("rpc_timeout_seconds", None)
-    if rpc_timeout is None or runtime_parameters != dict(prepared["parameters"]):
+    compatibility_mode = runtime_parameters.pop("compatibility_mode", None)
+    prepared_parameters = dict(prepared["parameters"])
+    prepared_parameters.pop("peer_count", None)
+    if rpc_timeout is None or runtime_parameters != prepared_parameters:
         raise AssertionError("Prepared and runtime algorithm parameters differ")
 
     digest = hashlib.sha256()
@@ -53,12 +58,15 @@ def _validate_run_provenance(
         raise AssertionError("Prepared private-shard digest differs")
 
     run_manifest = _read_json(run_dir / "run_manifest.json")
-    if run_manifest.get("schema") != "decentralized_semantica_run_v2":
+    if run_manifest.get("schema") != "decentralized_semantica_run_v3":
         raise AssertionError("Unexpected decentralized run-manifest schema")
-    if run_manifest.get("implementation") != "port_based_decentralized_semantica_v2":
+    if run_manifest.get("implementation") != "port_based_fully_decentralized_semantica_v3":
         raise AssertionError("Run is not labelled as the decentralized implementation")
     if run_manifest.get("status") != "complete":
         raise AssertionError("Decentralized run manifest is not complete")
+    expected_compatibility_flag = not bool(run_manifest.get("release_active", False))
+    if compatibility_mode is not expected_compatibility_flag:
+        raise AssertionError("Runtime compatibility flag differs from the run mode")
     if Path(run_manifest["prepared_dir"]).resolve() != prepared_dir:
         raise AssertionError("Run manifest references a different prepared directory")
     for field, expected in (
@@ -77,7 +85,7 @@ def _validate_run_provenance(
     if not run_manifest.get("runtime_environment"):
         raise AssertionError("Run manifest lacks runtime environment metadata")
     return {
-        "implementation": "port_based_decentralized_semantica_v2",
+        "implementation": "port_based_fully_decentralized_semantica_v3",
         "prepared_schema": str(prepared["schema"]),
         "bootstrap_schema": str(bootstrap_wire["schema"]),
         "epoch": bootstrap.epoch,
@@ -92,6 +100,16 @@ def _contacts_as_pairs(values: Sequence[Sequence[Mapping[str, Any]]]) -> List[Li
         [(int(contact["peer_id"]), float(contact["score"])) for contact in centroid]
         for centroid in values
     ]
+
+
+def _float32_values_match(actual: Any, expected: Any, atol: float) -> bool:
+    left = np.ascontiguousarray(np.asarray(actual, dtype="<f4"))
+    right = np.ascontiguousarray(np.asarray(expected, dtype="<f4"))
+    if left.shape != right.shape:
+        return False
+    if float(atol) == 0.0:
+        return left.tobytes() == right.tobytes()
+    return bool(np.allclose(left, right, rtol=0.0, atol=float(atol)))
 
 
 def _compare_contact_snapshots(
@@ -111,11 +129,10 @@ def _compare_contact_snapshots(
             raise AssertionError(
                 f"{context} centroid {centroid_index}: contacts {actual_ids} != {expected_ids}"
             )
-        if not np.allclose(
+        if not _float32_values_match(
             [score for _peer, score in actual_values],
             [score for _peer, score in expected_values],
-            rtol=0.0,
-            atol=float(atol),
+            float(atol),
         ):
             raise AssertionError(f"{context} centroid {centroid_index}: scores differ")
 
@@ -124,18 +141,13 @@ def _structural_validation(
     prepared_dir: Path,
     run_dir: Path,
     bootstrap: BootstrapConfig,
-    registry_wire: Mapping[str, Any],
+    inventory_wire: Mapping[str, Any],
     states: Mapping[int, Mapping[str, Any]],
 ) -> Dict[str, Any]:
     parameters = bootstrap.parameters
     peers = {
-        int(peer_id): Endpoint.from_wire(endpoint)
-        for peer_id, endpoint in registry_wire["peers"].items()
-    }
-    custody_wire = _read_json(run_dir / "custodian_assignments.json")
-    assignments = {
-        str(node_id): int(peer_id)
-        for node_id, peer_id in custody_wire["assignments"].items()
+        int(peer_id): PeerDescriptor.from_wire(descriptor).endpoint
+        for peer_id, descriptor in inventory_wire["peers"].items()
     }
     expected_rounds = set(range(int(parameters["expansion_rounds"]) + 1))
     centroid_entries: List[Tuple[int, int]] = []
@@ -203,11 +215,35 @@ def _structural_validation(
             raise AssertionError(f"Peer {peer_id} exported too many merged results")
         for node_id, node in state["nodes"].items():
             node_count += 1
-            expected_custodian = assignments.get(str(node_id))
-            if expected_custodian != peer_id:
-                raise AssertionError(
-                    f"Node {node_id} is on peer {peer_id}, expected {expected_custodian}"
+            proof = CustodyProof.from_wire(node["custody_proof"])
+            if proof.custodian.peer_id != peer_id:
+                raise AssertionError(f"Node {node_id} is not held by its proven custodian")
+            if proof.custodian.endpoint != peers[peer_id]:
+                raise AssertionError(f"Node {node_id} custody endpoint differs")
+            custody_seed = int(node["custody_seed"])
+            if node_id == root_node_id(bootstrap.epoch):
+                expected = genesis_custody_proof(
+                    bootstrap.epoch, node_id, proof.custodian
                 )
+                if custody_seed != 0 or proof != expected:
+                    raise AssertionError("Genesis custody proof differs")
+            else:
+                expected_digest = custody_digest(
+                    bootstrap.epoch,
+                    node_id,
+                    custody_seed,
+                    proof.candidate_peer_ids,
+                )
+                if proof.digest != expected_digest:
+                    raise AssertionError(f"Node {node_id} custody digest differs")
+                selected = int.from_bytes(bytes.fromhex(expected_digest), "big") % len(
+                    proof.candidate_peer_ids
+                )
+                if proof.candidate_peer_ids[selected] != peer_id:
+                    raise AssertionError(f"Node {node_id} custodian selection differs")
+                parent = node.get("parent")
+                if parent is None or custody_seed != int(parent["custody_seed"]) + 1:
+                    raise AssertionError(f"Node {node_id} custody seed does not follow its parent")
             if node["node_type"] == "leaf":
                 entries = [
                     (int(entry["peer_id"]), int(entry["centroid_index"]))
@@ -229,8 +265,6 @@ def _structural_validation(
         raise AssertionError("Delta-zero tree contains cloned centroid entries")
     if set(centroid_entries) != expected_entries:
         raise AssertionError("Canonical leaves do not contain exactly the fitted centroids")
-    if (run_dir / "root_failure.log").exists():
-        raise AssertionError("Root failure log exists")
     error_logs = [path for path in (run_dir / "errors").glob("*.log") if path.stat().st_size]
     if error_logs:
         raise AssertionError(f"Protocol error logs exist: {[path.name for path in error_logs]}")
@@ -255,6 +289,29 @@ def _structural_validation(
         raise AssertionError(
             f"Send/receive correlation failed: missing_receive={missing_receive}, "
             f"missing_send={missing_send}"
+        )
+    forbidden = {
+        "JOIN",
+        "PEER_LOOKUP",
+        "CUSTODIAN_ASSIGN",
+        "REGISTRY_STATUS",
+        "PROFILE_READY",
+        "ACTIVATE_SYNC",
+        "FINALIZE",
+        "SHUTDOWN",
+        "BUILD_TURN",
+        "ROUND0_START",
+        "EXPANSION_START",
+        "QUERY_START",
+        "EXPORT_STATE",
+    }
+    observed_types: set[str] = set()
+    for path in sorted((run_dir / "logs").glob("*.jsonl")):
+        with path.open(encoding="utf-8") as stream:
+            observed_types.update(str(json.loads(line)["message_type"]) for line in stream)
+    if observed_types.intersection(forbidden):
+        raise AssertionError(
+            f"Removed authority messages were observed: {sorted(observed_types.intersection(forbidden))}"
         )
     return {
         "peer_count": len(states),
@@ -368,10 +425,10 @@ def _compare_trees(run_dir: Path, expected: Mapping[str, Any], atol: float) -> N
             if actual_entries != expected_node["entries"]:
                 raise AssertionError(f"Leaf membership differs at {path}")
         else:
-            if not np.allclose(
-                actual_node["left"]["center"], expected_node["left_center"], rtol=0.0, atol=atol
-            ) or not np.allclose(
-                actual_node["right"]["center"], expected_node["right_center"], rtol=0.0, atol=atol
+            if not _float32_values_match(
+                actual_node["left"]["center"], expected_node["left_center"], atol
+            ) or not _float32_values_match(
+                actual_node["right"]["center"], expected_node["right_center"], atol
             ):
                 raise AssertionError(f"Split centers differ at {path}")
 
@@ -397,20 +454,23 @@ def _full_oracle_validation(
         fixture = {name: np.asarray(raw_fixture[name]) for name in raw_fixture.files}
     dataset = _central_dataset(prepared, fixture)
     parameters = prepared["parameters"]
-    layout = fit_dataset_centroids(
-        dataset,
-        method="elbow_silhouette",
-        degree=int(parameters["degree"]),
-        protected_random_fraction=0.0,
-        seed=int(prepared["seed"]),
-        adaptive_max_k=int(parameters["max_centroids"]),
-        progress_every=0,
-    )
+    with threadpool_limits(limits=1):
+        layout = fit_dataset_centroids(
+            dataset,
+            method="elbow_silhouette",
+            degree=int(parameters["degree"]),
+            protected_random_fraction=0.0,
+            seed=int(prepared["seed"]),
+            adaptive_max_k=int(parameters["max_centroids"]),
+            progress_every=0,
+        )
     for peer_id, state in states.items():
         actual = state["profile"]
         begin = int(layout.offsets[peer_id])
         end = int(layout.offsets[peer_id + 1])
-        if not np.allclose(actual["centroids"], layout.embeddings[begin:end], rtol=0.0, atol=atol):
+        if not _float32_values_match(
+            actual["centroids"], layout.embeddings[begin:end], atol
+        ):
             raise AssertionError(f"Peer {peer_id} centroid centers differ")
         if not np.array_equal(actual["cluster_doc_counts"], layout.cluster_doc_counts[begin:end]):
             raise AssertionError(f"Peer {peer_id} cluster counts differ")
@@ -428,11 +488,25 @@ def _full_oracle_validation(
         tree_insertion_mode="canonical",
     )
     oracle_rounds: Dict[int, Any] = {0: round0}
+    oracle_referrers: Dict[int, List[List[int | None]]] = {
+        round_index: [
+            [None for _ in range(int(layout.offsets[peer + 1] - layout.offsets[peer]))]
+            for peer in range(layout.peer_count)
+        ]
+        for round_index in range(1, int(parameters["expansion_rounds"]) + 1)
+    }
 
     def checkpoint(round_index: int, contacts: Any) -> None:
         oracle_rounds[int(round_index)] = [
             [list(centroid) for centroid in peer] for peer in contacts
         ]
+
+    def record_referrer(
+        round_index: int, peer_id: int, centroid_index: int, referrer: int
+    ) -> None:
+        oracle_referrers[int(round_index)][int(peer_id)][int(centroid_index)] = int(
+            referrer
+        )
 
     final_contacts, _expansion = expand_semantica_contacts(
         round0,
@@ -441,6 +515,7 @@ def _full_oracle_validation(
         rounds=int(parameters["expansion_rounds"]),
         seed=int(prepared["seed"]),
         checkpoint_callback=checkpoint,
+        referrer_callback=record_referrer,
     )
     for round_index, expected_by_peer in sorted(oracle_rounds.items()):
         for peer_id, expected in enumerate(expected_by_peer):
@@ -450,6 +525,15 @@ def _full_oracle_validation(
                 atol=atol,
                 context=f"peer {peer_id} round {round_index}",
             )
+    for round_index, expected_by_peer in sorted(oracle_referrers.items()):
+        for peer_id, expected in enumerate(expected_by_peer):
+            observed = states[peer_id].get("expansion_referrers", {}).get(
+                str(round_index)
+            )
+            if observed != expected:
+                raise AssertionError(
+                    f"Peer {peer_id} round {round_index} expansion referrers differ"
+                )
     expected_tree = _central_tree_snapshot(
         layout,
         int(parameters["leaf_capacity"]),
@@ -497,11 +581,10 @@ def _full_oracle_validation(
             actual_values = [(str(doc), float(score)) for doc, score in observed[key]]
             if [doc for doc, _score in actual_values] != [doc for doc, _score in expected_values]:
                 raise AssertionError(f"Peer {peer_id} {key} document IDs differ")
-            if not np.allclose(
+            if not _float32_values_match(
                 [score for _doc, score in actual_values],
                 [score for _doc, score in expected_values],
-                rtol=0.0,
-                atol=atol,
+                atol,
             ):
                 raise AssertionError(f"Peer {peer_id} {key} scores differ")
         if set(int(hop) for hop in observed["results_by_hop"]) != set(
@@ -514,11 +597,10 @@ def _full_oracle_validation(
             ]
             if [doc for doc, _score in actual_values] != [doc for doc, _score in expected_values]:
                 raise AssertionError(f"Peer {peer_id} hop {hop} result IDs differ")
-            if not np.allclose(
+            if not _float32_values_match(
                 [score for _doc, score in actual_values],
                 [score for _doc, score in expected_values],
-                rtol=0.0,
-                atol=atol,
+                atol,
             ):
                 raise AssertionError(f"Peer {peer_id} hop {hop} scores differ")
     return {
@@ -526,8 +608,10 @@ def _full_oracle_validation(
         "centroid_count": int(layout.embeddings.shape[0]),
         "tree_node_count": len(expected_tree),
         "rounds_compared": len(oracle_rounds),
+        "referrer_rounds_compared": len(oracle_referrers),
         "queries_compared": len(states),
         "float32_absolute_tolerance": float(atol),
+        "float_comparison": "bitwise" if float(atol) == 0.0 else "diagnostic_tolerance",
     }
 
 
@@ -535,7 +619,12 @@ def _assert_exact(actual: Any, expected: Any, context: str) -> None:
     if isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
         if not isinstance(actual, np.ndarray) or not isinstance(expected, np.ndarray):
             raise AssertionError(f"{context}: array type differs")
-        if not np.array_equal(actual, expected):
+        if (
+            actual.dtype != expected.dtype
+            or actual.shape != expected.shape
+            or np.ascontiguousarray(actual).tobytes()
+            != np.ascontiguousarray(expected).tobytes()
+        ):
             raise AssertionError(f"{context}: array values differ")
         return
     if isinstance(actual, Mapping) or isinstance(expected, Mapping):
@@ -572,7 +661,11 @@ def _contacts_algorithm_state(
     return {
         str(round_index): [
             [
-                {key: value for key, value in contact.items() if key != "endpoint"}
+                {
+                    key: value
+                    for key, value in contact.items()
+                    if key not in {"endpoint", "peer"}
+                }
                 for contact in centroid
             ]
             for centroid in by_centroid
@@ -679,7 +772,7 @@ def validate_run(
     run_dir: Path,
     *,
     structural_only: bool = False,
-    float32_atol: float = 1e-5,
+    float32_atol: float = 0.0,
     reference_run: Path | None = None,
     prejoin_run: Path | None = None,
 ) -> Dict[str, Any]:
@@ -688,21 +781,66 @@ def validate_run(
     prepared = _read_json(prepared_dir / "prepared_manifest.json")
     bootstrap_wire = _read_json(run_dir / "bootstrap.json")
     bootstrap = BootstrapConfig.from_wire(bootstrap_wire)
-    registry_wire = _read_json(run_dir / "discovered_peer_registry.json")
-    registry_peers = {int(peer_id) for peer_id in registry_wire["peers"]}
     states = load_peer_states(run_dir)
-    if set(states) != registry_peers:
-        raise AssertionError("Exported peer state set differs from discovered registry")
+    inventory_path = run_dir / "experiment_peer_inventory.json"
+    if inventory_path.exists():
+        inventory_wire = _read_json(inventory_path)
+    elif structural_only:
+        inventory_wire = {
+            "schema": "decentralized_semantica_external_active_inventory_v3",
+            "runtime_input": False,
+            "peers": {
+                str(peer_id): PeerDescriptor(
+                    peer_id,
+                    str(state["endpoint"]["host"]),
+                    int(state["endpoint"]["port"]),
+                    int(state["profile"]["version"]),
+                ).to_wire()
+                for peer_id, state in states.items()
+            },
+        }
+    else:
+        raise AssertionError(
+            "A full compatibility validation requires experiment_peer_inventory.json"
+        )
+    inventory_peers = {int(peer_id) for peer_id in inventory_wire["peers"]}
+    if set(states) != inventory_peers:
+        raise AssertionError("Exported peer state set differs from experiment inventory")
     report: Dict[str, Any] = {
-        "schema": "decentralized_semantica_validation_v2",
+        "schema": "decentralized_semantica_validation_v3",
         "status": "running",
         "mode": "structural_only" if structural_only else "full_centralized_oracle",
     }
-    report["provenance"] = _validate_run_provenance(
-        prepared_dir, run_dir, prepared, bootstrap_wire, bootstrap
-    )
+    if inventory_path.exists():
+        report["provenance"] = _validate_run_provenance(
+            prepared_dir, run_dir, prepared, bootstrap_wire, bootstrap
+        )
+    else:
+        if bootstrap_wire.get("schema") != "decentralized_semantica_bootstrap_v3":
+            raise AssertionError("Unexpected active bootstrap schema")
+        if bootstrap_wire.get("implementation") != "port_based_fully_decentralized_semantica_v3":
+            raise AssertionError("Active bootstrap has the wrong implementation label")
+        if "peers" in bootstrap_wire or "peer_ids" in bootstrap_wire:
+            raise AssertionError("Active bootstrap contains membership")
+        if bootstrap.epoch != str(prepared["epoch"]) or bootstrap.seed != int(prepared["seed"]):
+            raise AssertionError("Active bootstrap provenance differs from preparation")
+        active_parameters = dict(bootstrap.parameters)
+        active_parameters.pop("rpc_timeout_seconds", None)
+        if active_parameters.pop("compatibility_mode", None) is not False:
+            raise AssertionError("Active bootstrap has compatibility control enabled")
+        prepared_parameters = dict(prepared["parameters"])
+        prepared_parameters.pop("peer_count", None)
+        if active_parameters != prepared_parameters:
+            raise AssertionError("Active bootstrap algorithm parameters differ")
+        report["provenance"] = {
+            "implementation": "port_based_fully_decentralized_semantica_v3",
+            "mode": "active_external_state_audit",
+            "inventory_runtime_input": False,
+            "epoch": bootstrap.epoch,
+            "seed": bootstrap.seed,
+        }
     report["structural"] = _structural_validation(
-        prepared_dir, run_dir, bootstrap, registry_wire, states
+        prepared_dir, run_dir, bootstrap, inventory_wire, states
     )
     if not structural_only:
         report["oracle"] = _full_oracle_validation(

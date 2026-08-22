@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import platform
 import queue
+import shutil
 import sys
 import time
 import traceback
@@ -20,10 +21,19 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 import numpy as np
 import sklearn
 
-from .algorithms import root_node_id
-from .models import BootstrapConfig, Endpoint
+from .algorithms import genesis_custody_proof, root_node_id
+from .models import BootstrapConfig, ChildDescriptor, Endpoint, PeerDescriptor
 from .peer import run_peer_process
-from .protocol import RpcClient, pack_message, unpack_message
+from .protocol import (
+    ProtocolError,
+    RpcClient,
+    envelope,
+    pack_message,
+    read_frame,
+    unpack_message,
+    validate_envelope,
+    write_frame,
+)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -115,11 +125,212 @@ async def _configure_root(
     )
 
 
+class CompatibilityCoordinator:
+    """External total-order harness; it is deliberately not a Semantica peer."""
+
+    def __init__(
+        self,
+        bootstrap: BootstrapConfig,
+        peers: Sequence[PeerDescriptor],
+        log_path: Path,
+    ) -> None:
+        self.bootstrap = bootstrap
+        self.peers = list(peers)
+        self.log_path = Path(log_path)
+        self.endpoint = Endpoint("127.0.0.1", 0)
+        self.server: asyncio.AbstractServer | None = None
+        self.waiters: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+
+    def _log(
+        self, direction: str, message: Mapping[str, Any], target: Endpoint, size: int
+    ) -> None:
+        row = {
+            "time": time.time(),
+            "direction": direction,
+            "remote": target.to_wire(),
+            "source_peer_id": int(message["source_peer_id"]),
+            "source_endpoint": message["source_endpoint"],
+            "destination_peer_id": (
+                next(
+                    (
+                        peer.peer_id
+                        for peer in self.peers
+                        if peer.endpoint == target
+                    ),
+                    None,
+                )
+                if direction == "send"
+                else -1
+            ),
+            "destination_endpoint": (
+                target.to_wire() if direction == "send" else self.endpoint.to_wire()
+            ),
+            "message_type": message.get("message_type"),
+            "message_id": message.get("message_id"),
+            "request_id": message.get("request_id"),
+            "bytes": int(size),
+            "payload_bytes": len(pack_message(message.get("payload", {}))),
+            "phase": "EXTERNAL_COMPATIBILITY_HARNESS",
+            "sync_phase_key": message.get("payload", {}).get("phase_key"),
+            "sync_position": message.get("payload", {}).get("position"),
+        }
+        with self.log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _client(self) -> RpcClient:
+        return RpcClient(
+            source_peer_id=-1,
+            source_endpoint=self.endpoint,
+            epoch=self.bootstrap.epoch,
+            timeout=float(self.bootstrap.parameters.get("rpc_timeout_seconds", 30.0)),
+            log=self._log,
+        )
+
+    async def __aenter__(self) -> "CompatibilityCoordinator":
+        self.server = await asyncio.start_server(self._handle_client, "127.0.0.1", 0)
+        socket = self.server.sockets[0]
+        self.endpoint = Endpoint(str(socket.getsockname()[0]), int(socket.getsockname()[1]))
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request: Dict[str, Any] | None = None
+        remote = writer.get_extra_info("peername")
+        target = Endpoint(str(remote[0]), int(remote[1])) if remote else Endpoint("unknown", 0)
+        try:
+            request, size = await read_frame(reader)
+            validate_envelope(request, self.bootstrap.epoch)
+            target = Endpoint.from_wire(request["source_endpoint"])
+            self._log("receive", request, target, size)
+            message_type = str(request["message_type"])
+            key = str(request["payload"]["phase_key"])
+            waiter = self.waiters.get(key)
+            if waiter is None or waiter.done():
+                raise ProtocolError(f"No external phase is waiting for {key}")
+            if message_type == "SYNC_PHASE_COMPLETE":
+                waiter.set_result(dict(request["payload"]))
+            elif message_type == "SYNC_PHASE_FAILED":
+                waiter.set_exception(
+                    ProtocolError(
+                        f"Compatibility phase {key} failed at peer "
+                        f"{request['payload']['peer_id']}: {request['payload']['error']}"
+                    )
+                )
+            else:
+                raise ProtocolError(f"Coordinator rejects {message_type}")
+            response = envelope(
+                f"{message_type}_ACK",
+                epoch=self.bootstrap.epoch,
+                source_peer_id=-1,
+                source_endpoint=self.endpoint,
+                payload={"phase_key": key},
+                request_id=str(request["message_id"]),
+            )
+        except Exception as exc:
+            response = envelope(
+                "ERROR",
+                epoch=self.bootstrap.epoch,
+                source_peer_id=-1,
+                source_endpoint=self.endpoint,
+                payload={"error": str(exc)},
+                request_id=str(request.get("message_id")) if request else None,
+            )
+        sent = await write_frame(writer, response)
+        self._log("send", response, target, sent)
+        writer.close()
+        await writer.wait_closed()
+
+    async def link(self) -> None:
+        for position, peer in enumerate(self.peers):
+            next_peer = self.peers[position + 1] if position + 1 < len(self.peers) else None
+            await self._client().call(
+                peer.endpoint,
+                "SYNC_LINK",
+                {
+                    "position": position,
+                    "cohort_size": len(self.peers),
+                    "next": next_peer.to_wire() if next_peer else None,
+                    "coordinator_endpoint": self.endpoint.to_wire(),
+                },
+            )
+
+    async def phase(
+        self, phase: str, *, round_index: int | None = None, **payload: Any
+    ) -> Dict[str, Any]:
+        suffix = "" if round_index is None else f":{round_index}"
+        key = f"{phase}{suffix}"
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[Dict[str, Any]] = loop.create_future()
+        self.waiters[key] = waiter
+        token = {
+            "token_id": f"{self.bootstrap.epoch}:{key}",
+            "phase_key": key,
+            "phase": phase,
+            "position": 0,
+            **payload,
+        }
+        if round_index is not None:
+            token["round"] = int(round_index)
+        await self._client().call(self.peers[0].endpoint, "SYNC_TOKEN", token)
+        timeout = float(self.bootstrap.parameters.get("rpc_timeout_seconds", 30.0)) * max(2, len(self.peers))
+        try:
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        finally:
+            self.waiters.pop(key, None)
+
+    async def release(self) -> None:
+        for peer in self.peers:
+            await self._client().call(peer.endpoint, "SYNC_RELEASE", {})
+
+
+async def _run_compatibility_protocol(
+    bootstrap: BootstrapConfig,
+    peers: Sequence[PeerDescriptor],
+    log_path: Path,
+    *,
+    release_active: bool,
+) -> Dict[str, float]:
+    timings: Dict[str, float] = {}
+    async with CompatibilityCoordinator(bootstrap, peers, log_path) as coordinator:
+        await coordinator.link()
+        started = time.monotonic()
+        await coordinator.phase("BUILD")
+        timings["tree_build_seconds"] = time.monotonic() - started
+        stats = await coordinator.phase("STATS", maximum_tree_depth=0)
+        maximum_depth = int(stats["maximum_tree_depth"])
+        started = time.monotonic()
+        await coordinator.phase("ROUND0", maximum_tree_depth=maximum_depth)
+        timings["round0_seconds"] = time.monotonic() - started
+        for round_index in range(1, int(bootstrap.parameters["expansion_rounds"]) + 1):
+            started = time.monotonic()
+            await coordinator.phase("EXPANSION", round_index=round_index)
+            timings[f"expansion_round_{round_index}_seconds"] = time.monotonic() - started
+        started = time.monotonic()
+        await coordinator.phase("QUERY")
+        timings["query_seconds"] = time.monotonic() - started
+        await coordinator.phase("EXPORT")
+        if release_active:
+            await coordinator.release()
+    return timings
+
+
 def _terminate_processes(processes: Iterable[mp.Process]) -> None:
-    for process in processes:
+    values = list(processes)
+    for process in values:
         if process.is_alive():
             process.terminate()
-    for process in processes:
+    for process in values:
+        process.join(timeout=5.0)
+    for process in values:
+        if process.is_alive():
+            process.kill()
+    for process in values:
         process.join(timeout=5.0)
 
 
@@ -302,6 +513,16 @@ def aggregate_run_outputs(
     if visited != set(nodes):
         raise RuntimeError(f"Exported tree contains {len(set(nodes) - visited)} unreachable nodes")
     (run_dir / "tree_snapshot.msgpack").write_bytes(pack_message(canonical_nodes))
+    custody_audit = {
+        path: {
+            "node_id": node["node_id"],
+            "custodian_peer_id": int(node["custodian_peer_id"]),
+            "custody_seed": int(node["custody_seed"]),
+            "custody_proof": node["custody_proof"],
+        }
+        for path, node in canonical_nodes.items()
+    }
+    (run_dir / "custody_audit.msgpack").write_bytes(pack_message(custody_audit))
     leaf_nodes = [node for node in nodes.values() if node["node_type"] == "leaf"]
     _write_json(
         run_dir / "tree_snapshot_summary.json",
@@ -371,19 +592,6 @@ def aggregate_run_outputs(
     }
 
 
-def finalize_overlay(bootstrap_path: Path) -> Dict[str, Any]:
-    bootstrap_path = Path(bootstrap_path).resolve()
-    bootstrap = BootstrapConfig.from_wire(_read_json(bootstrap_path))
-    return asyncio.run(
-        _launcher_call(
-            bootstrap,
-            bootstrap_path.parent / "logs" / "finalizer.jsonl",
-            "FINALIZE",
-            {},
-        )
-    )
-
-
 def run_experiment(
     prepared_dir: Path,
     run_dir: Path,
@@ -393,7 +601,7 @@ def run_experiment(
     rpc_timeout_seconds: float = 30.0,
     start_method: str = "spawn",
     root_peer_id: int | None = None,
-    keep_active: bool = False,
+    release_active: bool = False,
 ) -> Dict[str, Any]:
     prepared_dir = Path(prepared_dir).resolve()
     run_dir = Path(run_dir).resolve()
@@ -431,7 +639,9 @@ def run_experiment(
     started_at = time.time()
     try:
         parameters = dict(prepared["parameters"])
+        parameters.pop("peer_count", None)
         parameters["rpc_timeout_seconds"] = float(rpc_timeout_seconds)
+        parameters["compatibility_mode"] = True
         root_process = context.Process(
             name=f"semantica-peer-{selected_root}",
             target=run_peer_process,
@@ -451,17 +661,24 @@ def run_experiment(
             selected_root,
             endpoint_timeout_seconds,
         )
+        root_peer = PeerDescriptor(
+            selected_root, root_endpoint.host, root_endpoint.port, 1
+        )
+        root_id = root_node_id(str(prepared["epoch"]))
+        root_proof = genesis_custody_proof(
+            str(prepared["epoch"]), root_id, root_peer
+        )
         bootstrap = BootstrapConfig(
-            epoch=str(prepared["epoch"]),
-            seed=int(prepared["seed"]),
-            root_peer_id=selected_root,
-            root_endpoint=root_endpoint,
-            parameters=parameters,
+            str(prepared["epoch"]),
+            int(prepared["seed"]),
+            ChildDescriptor(root_id, root_peer, 0, root_proof),
+            parameters,
         )
         bootstrap_wire = bootstrap.to_wire()
         run_manifest: Dict[str, Any] = {
-            "schema": "decentralized_semantica_run_v2",
-            "implementation": "port_based_decentralized_semantica_v2",
+            "schema": "decentralized_semantica_run_v3",
+            "implementation": "port_based_fully_decentralized_semantica_v3",
+            "mode": "external_compatibility_experiment",
             "status": "running",
             "prepared_dir": str(prepared_dir),
             "run_dir": str(run_dir),
@@ -469,11 +686,11 @@ def run_experiment(
             "root_node_id": root_node_id(bootstrap.epoch),
             "root_peer_id": selected_root,
             "bootstrap": bootstrap_wire,
-            "initial_cohort_size": len(peer_ids),
-            "join_order_policy": "sequential_private_shard_position",
-            "sync_schedule": "successor_token_chain",
-            "keep_active": bool(keep_active),
-            "launcher_role": "root_startup_ordered_peer_start_activation_wait_and_collection_only",
+            "experiment_peer_count": len(peer_ids),
+            "compatibility_order_policy": "sequential_private_shard_position",
+            "sync_schedule": "external_coordinator_successor_token_chain",
+            "release_active": bool(release_active),
+            "launcher_role": "external_non_peer_compatibility_harness_and_process_supervisor",
             "prepared_manifest_schema": str(prepared["schema"]),
             "prepared_epoch": str(prepared["epoch"]),
             "prepared_seed": int(prepared["seed"]),
@@ -486,15 +703,15 @@ def run_experiment(
         _wait_peer_event(
             endpoint_queue,
             processes,
-            "JOINED",
+            "READY",
             selected_root,
             endpoint_timeout_seconds,
         )
-        # Publish the out-of-band bootstrap only after CONFIGURE has created
-        # the empty root node and the root's own JOIN has been acknowledged.
+        # Publish only the genesis descriptor and public algorithm parameters.
         _write_json(run_dir / "bootstrap.json", bootstrap_wire)
         _write_json(run_dir / "run_manifest.json", run_manifest)
 
+        peer_descriptors = [root_peer]
         for peer_id in peer_ids[1:]:
             process = context.Process(
                 name=f"semantica-peer-{peer_id}",
@@ -509,72 +726,104 @@ def run_experiment(
             )
             process.start()
             processes.append(process)
-            _wait_peer_event(
+            endpoint = _wait_peer_event(
                 endpoint_queue,
                 processes,
-                "JOINED",
+                "LISTENING",
                 peer_id,
                 endpoint_timeout_seconds,
             )
-        _collect_ready_peers(
-            endpoint_queue,
-            processes,
-            peer_ids,
-            endpoint_timeout_seconds,
-        )
+            peer_descriptors.append(
+                PeerDescriptor(peer_id, endpoint.host, endpoint.port, 1)
+            )
+            _wait_peer_event(
+                endpoint_queue,
+                processes,
+                "READY",
+                peer_id,
+                endpoint_timeout_seconds,
+            )
 
-        asyncio.run(
-            _launcher_call(
-                bootstrap,
-                launcher_log,
-                "ACTIVATE_SYNC",
-                {
-                    "cohort_size": len(peer_ids),
-                    "checkpoint_state": bool(keep_active),
-                },
+        inventory = {
+            "schema": "decentralized_semantica_experiment_inventory_v3",
+            "runtime_input": False,
+            "peer_order": [peer.peer_id for peer in peer_descriptors],
+            "peers": {
+                str(peer.peer_id): peer.to_wire() for peer in peer_descriptors
+            },
+        }
+        _write_json(run_dir / "experiment_peer_inventory.json", inventory)
+        timings = asyncio.run(
+            asyncio.wait_for(
+                _run_compatibility_protocol(
+                    bootstrap,
+                    peer_descriptors,
+                    run_dir / "logs" / "compatibility_coordinator.jsonl",
+                    release_active=release_active,
+                ),
+                timeout=float(run_timeout_seconds),
             )
         )
-
-        deadline = time.monotonic() + float(run_timeout_seconds)
-        finalized = False
-        while True:
-            for process in processes:
-                process.join(timeout=0.0)
-            bad_exit_codes = {
-                process.name: process.exitcode
-                for process in processes
-                if process.exitcode not in (None, 0)
-            }
-            if bad_exit_codes:
-                raise RuntimeError(f"Peer process failures: {bad_exit_codes}")
-            exited = [process.name for process in processes if process.exitcode is not None]
-            run_complete = (run_dir / "run_complete.json").exists()
-            overlay_active = (run_dir / "overlay_active.json").exists()
-            if overlay_active and not keep_active and not finalized:
-                asyncio.run(
-                    _launcher_call(bootstrap, launcher_log, "FINALIZE", {})
-                )
-                finalized = True
-            if exited and not run_complete:
-                raise RuntimeError(
-                    "Peer processes exited before root completion: " + ", ".join(exited)
-                )
-            if len(exited) == len(processes):
-                break
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.1)
-        alive = [process.name for process in processes if process.is_alive()]
-        if alive:
-            raise TimeoutError(f"Peer processes did not finish before timeout: {alive}")
-        if not (run_dir / "run_complete.json").exists():
-            raise RuntimeError("Root custodian exited without declaring run completion")
-        registry_wire = _read_json(run_dir / "discovered_peer_registry.json")
-        peers = {
-            int(peer_id): Endpoint.from_wire(endpoint)
-            for peer_id, endpoint in registry_wire["peers"].items()
+        if release_active:
+            checkpoint_dir = run_dir / "compatibility_checkpoint"
+            shutil.copytree(run_dir / "state", checkpoint_dir / "state")
+            active_parameters = dict(bootstrap.parameters)
+            active_parameters["compatibility_mode"] = False
+            active_bootstrap = BootstrapConfig(
+                bootstrap.epoch,
+                bootstrap.seed,
+                bootstrap.root,
+                active_parameters,
+            )
+            bootstrap = active_bootstrap
+            bootstrap_wire = active_bootstrap.to_wire()
+            run_manifest["bootstrap"] = bootstrap_wire
+            _write_json(run_dir / "bootstrap.json", bootstrap_wire)
+            _write_json(
+                run_dir / "overlay_released.json",
+                {
+                    "status": "active",
+                    "epoch": bootstrap.epoch,
+                    "compatibility_coordinator_closed": True,
+                    "stop_request": str(run_dir / "stop_requested"),
+                },
+            )
+            deadline = time.monotonic() + float(run_timeout_seconds)
+            while not (run_dir / "stop_requested").exists():
+                failed = {
+                    process.name: process.exitcode
+                    for process in processes
+                    if process.exitcode not in (None, 0)
+                }
+                if failed:
+                    raise RuntimeError(f"Released peer process failures: {failed}")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Released overlay did not receive a local stop request")
+                time.sleep(0.1)
+        _terminate_processes(processes)
+        failed = {
+            process.name: process.exitcode
+            for process in processes
+            if process.exitcode not in (0, None)
         }
+        if failed:
+            raise RuntimeError(f"Peer processes failed during local stop: {failed}")
+        if release_active:
+            shutil.move(str(run_dir / "state"), str(run_dir / "released_state"))
+            shutil.copytree(
+                run_dir / "compatibility_checkpoint" / "state", run_dir / "state"
+            )
+        peers = {peer.peer_id: peer.endpoint for peer in peer_descriptors}
         aggregate = aggregate_run_outputs(run_dir, peers, bootstrap.epoch)
+        _write_json(
+            run_dir / "run_complete.json",
+            {
+                "status": "complete",
+                "epoch": bootstrap.epoch,
+                "coordinator_role": "external_compatibility_only",
+                "phase_timings": timings,
+            },
+        )
         run_manifest.update(
             {
                 "status": "complete",
@@ -597,5 +846,6 @@ def run_experiment(
         _write_json(run_dir / "launcher_failure.json", failure)
         raise
     finally:
+        _terminate_processes(processes)
         endpoint_queue.close()
         endpoint_queue.join_thread()

@@ -5,14 +5,17 @@
 
 ## Decentralized implementation
 
-The repository includes a port-based, membership-free implementation in
+The repository includes a port-based, fully decentralized implementation in
 `decentralized_semantica/`. Each peer runs as an isolated process with its own
-TCP port and private shard. Peers join through a root bootstrap endpoint rather
-than receiving a global membership list.
+TCP port and private shard. Active operation has no membership registry or
+coordinator: the root peer is only the custodian of the genesis node, and child
+custodians are selected by a public, independently verified hash rule from the
+centroid owners in each child.
 
 See the **[decentralized usage guide](decentralized_semantica/README.md)** for
-installation, deterministic centralized-parity runs, active late joining,
-validation, Slurm submission, outputs, and tests.
+installation, exact centralized-parity experiments, concurrent and late active
+joining, deterministic custody proofs, validation, Slurm submission, outputs,
+and tests.
 
 ## 🚧 Work in Progress
 

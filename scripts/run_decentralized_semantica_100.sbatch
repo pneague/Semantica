@@ -37,7 +37,7 @@ cd "${PROJECT_DIR}"
   --peer-count 100 \
   --seed 42
 
-"${PYTHON_BIN}" -m decentralized_semantica run \
+"${PYTHON_BIN}" -m decentralized_semantica compat-run \
   --prepared-dir "${PREPARED_DIR}" \
   --run-dir "${RUNTIME_DIR}" \
   --rpc-timeout-seconds 30 \
@@ -47,7 +47,6 @@ cd "${PROJECT_DIR}"
 VALIDATE_ARGS=(
   --prepared-dir "${PREPARED_DIR}"
   --run-dir "${RUNTIME_DIR}"
-  --float32-atol 1e-5
 )
 if [[ -n "${REFERENCE_RUN:-}" ]]; then
   VALIDATE_ARGS+=(--reference-run "${REFERENCE_RUN}")
