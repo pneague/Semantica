@@ -1,0 +1,4 @@
+msgpack>=1.0,<2
+numpy>=1.26,<3
+scikit-learn>=1.6,<2
+threadpoolctl>=3,<4
